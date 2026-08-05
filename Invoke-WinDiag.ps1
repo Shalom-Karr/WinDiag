@@ -603,7 +603,39 @@ function Invoke-Collector {
     while ($attempt -le $Retries) {
         $attempt++
         try {
-            & $Body
+            # Non-terminating errors - which is what most cmdlets raise when a
+            # WMI class is absent, a path is denied, or a provider is not
+            # installed - do NOT reach the catch below, and with the default
+            # preference they print raw red text over the progress output. On a
+            # machine missing an optional WMI class that looks alarming while
+            # being entirely expected.
+            #
+            # So: silence them for the duration of the body, then drain whatever
+            # landed in $Error into the section file and Errors.log. They end up
+            # recorded where an analyst can use them instead of scrolling past
+            # them, and a non-terminating error still does not abort a collector
+            # that can carry on without that one value.
+            $errMark = $global:Error.Count
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = 'SilentlyContinue'
+            try     { & $Body }
+            finally {
+                $ErrorActionPreference = $prevEap
+                $newErrs = $global:Error.Count - $errMark
+                if ($newErrs -gt 0) {
+                    Out-Raw ''
+                    Out-Raw ("  [{0} non-terminating error(s) during this collector - recorded, not fatal]" -f $newErrs)
+                    for ($ei = $newErrs - 1; $ei -ge 0; $ei--) {
+                        $er = $global:Error[$ei]
+                        if ($null -eq $er) { continue }
+                        $msg = "$er"
+                        $where = ''
+                        try { if ($er.InvocationInfo) { $where = ' @ ' + $er.InvocationInfo.MyCommand } } catch { }
+                        Out-Raw ("    - " + $msg + $where)
+                        Write-Stream 'Warnings' ("{0,-45} {1}" -f $Name, ($msg + $where))
+                    }
+                }
+            }
             $sw.Stop()
             $script:Stats.Succeeded++
             Out-Raw ("[collector OK - {0:N2}s]" -f $sw.Elapsed.TotalSeconds)
@@ -943,8 +975,8 @@ Invoke-Section 'System Identity and Hardware' 'system' {
     Invoke-Collector 'Battery and power adapter' {
         Out-RawList (Get-CimInstance Win32_Battery) 'Win32_Battery'
         try {
-            $s = Get-CimInstance -Namespace root\WMI -ClassName BatteryStaticData
-            $f = Get-CimInstance -Namespace root\WMI -ClassName BatteryFullChargedCapacity
+            $s = Get-CimInstance -Namespace root\WMI -ClassName BatteryStaticData -ErrorAction Stop
+            $f = Get-CimInstance -Namespace root\WMI -ClassName BatteryFullChargedCapacity -ErrorAction Stop
             Out-RawList $s 'BatteryStaticData'
             Out-RawList $f 'BatteryFullChargedCapacity'
             if ($s -and $f -and $s.DesignedCapacity -gt 0) {
@@ -1004,7 +1036,7 @@ Invoke-Section 'System Identity and Hardware' 'system' {
 # =============================================================== 2. CPU
 Invoke-Section 'CPU and Scheduling' 'cpu' {
 
-    Invoke-Collector 'Per-core utilisation (3 samples)' 'Reveals single-threaded saturation hidden by the average.' {
+    Invoke-Collector 'Per-core utilisation (3 samples)' -Describe 'Per-core sampling, so single-core saturation is visible separately from the average.' -Body {
         $s = Get-Counter '\Processor(*)\% Processor Time' -SampleInterval 2 -MaxSamples 3 -ErrorAction SilentlyContinue
         $rows = $s.CounterSamples | Group-Object InstanceName | ForEach-Object {
             [pscustomobject]@{ Core = $_.Name; AvgPct = [math]::Round((($_.Group | Measure-Object CookedValue -Average).Average),2) }
@@ -1013,7 +1045,7 @@ Invoke-Section 'CPU and Scheduling' 'cpu' {
         Save-Json $rows 'cpu_percore'
     }
 
-    Invoke-Collector 'Processor queue length' 'Threads waiting for a CPU slice.' {
+    Invoke-Collector 'Processor queue length' -Describe 'Count of threads waiting for a CPU slice.' -Body {
         $q = Get-Counter '\System\Processor Queue Length' -SampleInterval 1 -MaxSamples 5 -ErrorAction SilentlyContinue
         Out-RawObject ($q.CounterSamples | Select-Object TimeStamp, @{n='QueueLength';e={$_.CookedValue}}) 'Samples'
         Out-KV 'Average' ([math]::Round((($q.CounterSamples | Measure-Object CookedValue -Average).Average),2))
