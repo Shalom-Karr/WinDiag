@@ -205,8 +205,15 @@ if (-not $script:IsElevated -and -not $NoElevate) {
         Write-Host ''
 
         try {
+            # Relaunch powershell.exe specifically, not whatever host is running.
+            # powershell_ise.exe accepts -File but not -EncodedCommand, so under
+            # the ISE the UAC prompt would succeed, nothing would be collected,
+            # and this window would still report success.
             $psExe = (Get-Process -Id $PID).Path
-            if (-not $psExe) { $psExe = 'powershell.exe' }
+            $leaf  = ''
+            if ($psExe) { $leaf = [System.IO.Path]::GetFileName($psExe).ToLower() }
+            if ($leaf -ne 'powershell.exe' -and $leaf -ne 'pwsh.exe') { $psExe = Join-Path $PSHOME 'powershell.exe' }
+            if (-not (Test-Path -LiteralPath $psExe)) { $psExe = 'powershell.exe' }
             Start-Process -FilePath $psExe -ArgumentList $argLine -Verb RunAs -ErrorAction Stop | Out-Null
             Write-Host '  Elevated window started. Results are written there.' -ForegroundColor Green
             Write-Host '  This window can be closed.' -ForegroundColor Green
@@ -266,6 +273,11 @@ $script:Limits = @{
 # ##############################################################################
 # REGION: PACKAGE LAYOUT
 # ##############################################################################
+
+# PowerShell 5.1's -Encoding UTF8 writes a BOM. The package is meant to be
+# parsed by another program, and a BOM makes json.load() fail outright and
+# shows up glued to the first CSV column header. One shared no-BOM encoder.
+$script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 $script:PkgName = "WinDiag_$($script:Cfg.Computer)_$($script:Cfg.Stamp)"
 
@@ -418,7 +430,7 @@ $script:CurrentRawFile = $null
 function Open-RawFile {
     param([string]$Name)
     $script:CurrentRawFile = Join-Path $script:Dirs.Raw "$Name.txt"
-    if (-not (Test-Path $script:CurrentRawFile)) {
+    if (-not (Test-Path -LiteralPath $script:CurrentRawFile)) {
         Set-Content -LiteralPath $script:CurrentRawFile -Value '' -Encoding UTF8
     }
 }
@@ -481,7 +493,9 @@ function Save-Csv {
     if ($null -eq $Object) { return }
     $p = Join-Path $script:Dirs.Csv "$Name.csv"
     try {
-        $Object | Export-Csv -LiteralPath $p -NoTypeInformation -Encoding UTF8 -Force -ErrorAction Stop
+        $csv = $Object | ConvertTo-Csv -NoTypeInformation -ErrorAction Stop
+        [System.IO.File]::WriteAllLines($p, $csv, $script:Utf8NoBom)
+        if (-not (Test-Path -LiteralPath $p)) { throw "csv file absent after write: $p" }
         Write-DiagLog "wrote csv/$Name.csv" 'DEBUG' 'Save-Csv' -NoConsole
     } catch {
         Write-DiagLog "CSV export failed for $Name : $($_.Exception.Message)" 'WARN' 'Save-Csv'
@@ -724,7 +738,7 @@ function Get-SysinternalsTool {
         "C:\Sysinternals\$Exe",
         "C:\Tools\Sysinternals\$Exe",
         "$env:USERPROFILE\Sysinternals\$Exe")) {
-        if (Test-Path $p) { return $p }
+        if (Test-Path -LiteralPath $p) { return $p }
     }
     return $null
 }
@@ -864,9 +878,14 @@ Invoke-Section 'System Summary' 'summary' {
         Out-Raw ''
         Out-Raw '--- Storage ---'
         foreach ($d in (Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3')) {
-            $used = $d.Size - $d.FreeSpace
-            Out-KV $d.DeviceID ('{0:N0} GB of {1:N0} GB used ({2:N1}% free) - {3} {4}' -f `
-                ($used/1GB), ($d.Size/1GB), (($d.FreeSpace/$d.Size)*100), $d.FileSystem, $d.VolumeName)
+            # An unformatted or recovering volume can report Size 0. Dividing
+            # by it throws, which would abort the entire About-page collector.
+            $used = 0
+            if ($d.Size) { $used = $d.Size - $d.FreeSpace }
+            $freePct = 'n/a'
+            if ($d.Size -gt 0) { $freePct = [math]::Round(($d.FreeSpace / $d.Size) * 100, 1) }
+            Out-KV $d.DeviceID ('{0:N0} GB of {1:N0} GB used ({2}% free) - {3} {4}' -f `
+                ($used/1GB), ($d.Size/1GB), $freePct, $d.FileSystem, $d.VolumeName)
         }
         foreach ($p in (Get-PhysicalDisk -ErrorAction SilentlyContinue)) {
             Out-KV ('  Physical: ' + $p.FriendlyName) ('{0:N0} GB, {1}, bus {2}, health {3}' -f `
@@ -948,12 +967,15 @@ Invoke-Section 'System Identity and Hardware' 'system' {
     Invoke-Collector 'Memory modules and slots' {
         $mods = Get-CimInstance Win32_PhysicalMemory
         Out-RawList $mods 'Win32_PhysicalMemory (per DIMM)'
-        $arr = Get-CimInstance Win32_PhysicalMemoryArray
+        # Multi-socket machines return one object per memory controller, and
+        # Object[] / Int32 is not a valid operation - it would throw here.
+        $arr = @(Get-CimInstance Win32_PhysicalMemoryArray)
         Out-RawList $arr 'Win32_PhysicalMemoryArray'
         Out-Raw ''
         Out-KV 'Modules installed' (@($mods).Count)
-        Out-KV 'Slots on board'    $arr.MemoryDevices
-        Out-KV 'Board max (GB)'    ([math]::Round($arr.MaxCapacityEx/1MB,0))
+        Out-KV 'Memory arrays'     $arr.Count
+        Out-KV 'Slots on board'    (($arr | Measure-Object MemoryDevices -Sum).Sum)
+        Out-KV 'Board max (GB)'    ([math]::Round(((($arr | Measure-Object MaxCapacityEx -Sum).Sum)/1MB),0))
         $banks = @($mods | Select-Object -ExpandProperty BankLabel -Unique)
         Out-KV 'Distinct bank labels' ($banks -join ', ')
         Out-Raw ''
@@ -1157,7 +1179,11 @@ Invoke-Section 'Memory' 'memory' {
         Out-KV 'FreePhysicalMemory_GB'  ([math]::Round($os.FreePhysicalMemory/1MB,3))
         Out-KV 'TotalVirtualMemory_GB'  ([math]::Round($os.TotalVirtualMemorySize/1MB,3))
         Out-KV 'FreeVirtualMemory_GB'   ([math]::Round($os.FreeVirtualMemory/1MB,3))
-        Out-KV 'UsedPhysicalPercent'    ([math]::Round((($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)/$os.TotalVisibleMemorySize)*100,2))
+        if ($os.TotalVisibleMemorySize -gt 0) {
+            Out-KV 'UsedPhysicalPercent' ([math]::Round((($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)/$os.TotalVisibleMemorySize)*100,2))
+        } else {
+            Out-KV 'UsedPhysicalPercent' '(TotalVisibleMemorySize reported as zero - cannot compute)'
+        }
     }
 
     Invoke-Collector 'Memory performance counters' {
@@ -1176,7 +1202,7 @@ Invoke-Section 'Memory' 'memory' {
         }
         Out-Raw ''
         Out-Raw 'CONTEXT: Pages/sec counts hard faults resolved from disk. Page Faults/sec includes soft faults resolved from RAM.'
-        Out-Raw 'CONTEXT: Commit Limit = physical RAM + page file size. Committed Bytes exceeding physical RAM is normal.'
+        Out-Raw 'CONTEXT: Commit Limit = physical RAM + page file size. Committed Bytes can exceed physical RAM because the page file extends the limit.'
         Out-Raw 'CONTEXT: Free System PTEs are kernel virtual address mappings; the pool is sized dynamically on 64-bit Windows.'
     }
 
@@ -1214,12 +1240,12 @@ Invoke-Section 'Memory' 'memory' {
         Out-RawObject $rows 'All processes by memory'
         Save-Csv  $rows 'memory_processes'
         Save-Json $rows 'memory_processes'
-        Out-Raw 'CONTEXT: PrivateBytes materially exceeding WorkingSet indicates committed memory paged out or never touched.'
+        Out-Raw 'CONTEXT: PrivateBytes is committed address space regardless of physical residence. WorkingSet is the subset currently in physical RAM. The difference is in the page file or has not been accessed.'
     }
 
     Invoke-Collector 'GDI and USER object counts per process' {
         try {
-            if (-not ('WinDiagGdi' -as [type])) {
+            if (-not ('Win32.WinDiagGdi' -as [type])) {   # must be namespace-qualified or this guard never matches
                 Add-Type -Name WinDiagGdi -Namespace Win32 -MemberDefinition @'
 [DllImport("user32.dll")] public static extern int GetGuiResources(IntPtr hProcess, int uiFlags);
 '@ -ErrorAction Stop
@@ -1304,7 +1330,7 @@ Invoke-Section 'Storage' 'storage' {
             Out-RawList $rc 'StorageReliabilityCounter'
         }
         try {
-            Out-RawObject (Get-CimInstance -Namespace root\wmi -ClassName MSStorageDriver_FailurePredictStatus) 'FailurePredictStatus'
+            Out-RawObject (Get-CimInstance -Namespace root\wmi -ClassName MSStorageDriver_FailurePredictStatus -ErrorAction Stop) 'FailurePredictStatus'
         } catch { Out-Raw "FailurePredictStatus: $($_.Exception.Message)" }
         Out-Raw 'CONTEXT: Wear is reported as a percentage of rated endurance consumed. Temperature is in Celsius.'
     }
@@ -1553,8 +1579,26 @@ Invoke-Section 'Storage' 'storage' {
             Out-RawObject (Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName=$p} -MaxEvents 40 -ErrorAction SilentlyContinue |
                 Select-Object TimeCreated, Id, LevelDisplayName, Message) "Application log: $p"
         }
-        Out-RawObject (Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName=@('disk','Ntfs','storport','stornvme','iaStor','iaStorA','atapi','volsnap')} -MaxEvents 200 -ErrorAction SilentlyContinue |
-            Select-Object TimeCreated, ProviderName, Id, LevelDisplayName, Message) 'System log: storage stack providers'
+        # Get-WinEvent -FilterHashtable rejects the WHOLE filter with "The
+        # parameter is incorrect" when even one named provider is not registered
+        # on this machine, and storage miniport providers vary by hardware. So
+        # resolve against what is actually registered, then query each provider
+        # separately so one absentee cannot void the rest.
+        $storProviders = @('disk','Ntfs','storport','stornvme','iaStor','iaStorA','iaStorAVC','atapi','volsnap','vhdmp')
+        $registered = @()
+        try { $registered = @(Get-WinEvent -ListProvider * -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) } catch { }
+        Out-KV 'storage providers present'      (($storProviders | Where-Object { $registered -contains $_ }) -join ', ')
+        Out-KV 'storage providers not present'  (($storProviders | Where-Object { $registered -notcontains $_ }) -join ', ')
+        Out-Raw 'CONTEXT: A provider listed as not present is not registered on this machine, which is normal - storage miniport providers depend on the controller and driver in use.'
+        foreach ($prov in $storProviders) {
+            if ($registered -notcontains $prov) { continue }
+            try {
+                $pe = Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName=$prov} -MaxEvents 200 -ErrorAction Stop
+                Out-RawObject ($pe | Select-Object TimeCreated, ProviderName, Id, LevelDisplayName, Message) ("System log provider: " + $prov)
+            } catch {
+                Out-Raw ("  provider '" + $prov + "': " + $_.Exception.Message)
+            }
+        }
         Out-Raw 'CONTEXT: disk event 7 and 11 are hardware errors, 51 is a paging error during I/O, Ntfs 55 is filesystem structure corruption, storport records I/O timeouts and retries.'
     }
 
@@ -1892,6 +1936,10 @@ Invoke-Section 'Network' 'network' {
         $m = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
                 $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
                 $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+        if ($null -eq $m) {
+            Out-Raw 'SKIPPED: the AsTask overload for IAsyncOperation`1 was not found on this runtime, so WinRT usage data cannot be read. This is absent data, not zero usage.'
+            return
+        }
         [Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime] | Out-Null
         [Windows.Networking.Connectivity.NetworkUsage,Windows.Networking.Connectivity,ContentType=WindowsRuntime] | Out-Null
         $end = [DateTimeOffset]::Now; $start = $end.AddDays(-30)
@@ -1903,7 +1951,9 @@ Invoke-Section 'Network' 'network' {
             try {
                 $op = $p.GetNetworkUsageAsync($start,$end,[Windows.Networking.Connectivity.DataUsageGranularity]::Total,$st)
                 $t = $m.MakeGenericMethod([System.Collections.Generic.IReadOnlyList[Windows.Networking.Connectivity.NetworkUsage]]).Invoke($null,@($op))
-                $t.Wait(-1) | Out-Null
+                # -1 is Timeout.Infinite. A wedged Network List Manager would
+                # hang the entire run, once per saved network profile.
+                if (-not $t.Wait(15000)) { Out-Raw ("  [profile '" + $p.ProfileName + "' timed out after 15s - skipped]"); continue }
                 $r=0;$s=0; foreach ($u in $t.Result) { $r+=$u.BytesReceived; $s+=$u.BytesSent }
                 if (($r+$s) -gt 0) { $rows += [pscustomobject]@{ Profile=$p.ProfileName; RecvGB=ConvertTo-GB $r; SentGB=ConvertTo-GB $s; TotalGB=ConvertTo-GB ($r+$s) } }
             } catch { }
@@ -2014,9 +2064,15 @@ Invoke-Section 'Network' 'network' {
     }
 
     Invoke-Collector 'Internet throughput measurement' -NeedsInternet -Retries 0 {
+        # These are process-wide statics. Left set, they would force TLS 1.2
+        # only on every collector that runs after this one.
+        $prevProto = [Net.ServicePointManager]::SecurityProtocol
+        $prevE100  = [Net.ServicePointManager]::Expect100Continue
+        $prevConn  = [Net.ServicePointManager]::DefaultConnectionLimit
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         [Net.ServicePointManager]::Expect100Continue = $false
         [Net.ServicePointManager]::DefaultConnectionLimit = 64
+        try {
 
         Out-Raw 'Method: single-stream HTTP against the Cloudflare speed-test edge (speed.cloudflare.com).'
         Out-Raw 'CONTEXT: A single TCP stream is throughput-limited by latency and window size. Consumer speed-test sites open 6-16 parallel streams and therefore report higher numbers. Treat these figures as a single-connection floor, not a line-rate ceiling.'
@@ -2127,6 +2183,12 @@ Invoke-Section 'Network' 'network' {
             Download  = $dlRows
             Upload    = $ulRows
         }) 'net_throughput'
+        }
+        finally {
+            [Net.ServicePointManager]::SecurityProtocol       = $prevProto
+            [Net.ServicePointManager]::Expect100Continue      = $prevE100
+            [Net.ServicePointManager]::DefaultConnectionLimit = $prevConn
+        }
     }
 
     Invoke-Collector 'Time synchronisation' {
@@ -2194,10 +2256,17 @@ Invoke-Section 'Content Filtering and Interception' 'filtering' {
                 if (-not $r.Server) { $r.Server = $er.Headers['Server'] }
                 $r.ContentType = $er.ContentType
                 foreach ($k in $er.Headers.AllKeys) { $r.Headers[$k] = $er.Headers[$k] }
+                # Substring(0,1500) throws when the body is shorter than 1500
+                # chars, which block pages routinely are - so the sample was
+                # lost on exactly the responses this probe is for, and the
+                # reader was never closed.
+                $rd = $null
                 try {
                     $rd = New-Object System.IO.StreamReader($er.GetResponseStream())
-                    $r.BodySample = $rd.ReadToEnd().Substring(0,1500); $rd.Close()
+                    $body = $rd.ReadToEnd()
+                    $r.BodySample = $body.Substring(0, [Math]::Min(1500, $body.Length))
                 } catch { }
+                finally { if ($rd) { try { $rd.Dispose() } catch { } } }
             }
         } catch {
             $r.Exception = $_.Exception.Message
@@ -2206,7 +2275,7 @@ Invoke-Section 'Content Filtering and Interception' 'filtering' {
         return [pscustomobject]$r
     }
 
-    Invoke-Collector 'Techloq filter endpoint probe' -NeedsInternet {
+    Invoke-Collector 'Techloq filter endpoint probe' -NeedsInternet -Retries 0 {
         $p = Get-HttpProbe 'https://filter.techloq.com/'
         Out-KV 'URL'          $p.Url
         Out-KV 'Reached'      $p.Reached
@@ -2227,7 +2296,7 @@ Invoke-Section 'Content Filtering and Interception' 'filtering' {
         Save-Json $p 'filter_techloq_probe'
     }
 
-    Invoke-Collector 'Reference site probes and block-page header capture' -NeedsInternet {
+    Invoke-Collector 'Reference site probes and block-page header capture' -NeedsInternet -Retries 0 {
         # Two groups. The first are rarely filtered and establish what an
         # unfiltered response looks like from this machine. The second are the
         # categories filters commonly act on - without them the probe never
@@ -2295,8 +2364,18 @@ Invoke-Section 'Content Filtering and Interception' 'filtering' {
             }
             # Redirect-style blocks: the request completes with 200 but the final
             # URL is the filter's own block page rather than the requested origin.
-            if ($p.FinalUri -and ($p.FinalUri -notmatch [regex]::Escape(([Uri]$p.Url).Host))) {
-                Out-KV ($p.Url + ' -> redirected to') $p.FinalUri
+            # Compare host to host. Matching the requested host against the
+            # entire final URL fails whenever the block page carries the
+            # original URL in a query parameter - which Techloq's does.
+            if ($p.FinalUri) {
+                $reqHost = ''
+                $finHost = ''
+                try { $reqHost = ([Uri]$p.Url).Host }     catch { }
+                try { $finHost = ([Uri]$p.FinalUri).Host } catch { }
+                if ($finHost -and $reqHost -and $finHost -ne $reqHost) {
+                    Out-KV ($p.Url + ' -> final host differs') ($reqHost + '  ->  ' + $finHost)
+                    Out-KV ($p.Url + ' -> final URL')          $p.FinalUri
+                }
             }
         }
         Out-Raw ''
@@ -2349,7 +2428,7 @@ Invoke-Section 'Content Filtering and Interception' 'filtering' {
         Out-Raw 'CONTEXT: Names are matched against a fixed vendor list. Absence from this list is not evidence that no filter is installed - only that none of these specific vendor strings appeared.'
     }
 
-    Invoke-Collector 'TLS certificate chains as presented on the wire' -NeedsInternet {
+    Invoke-Collector 'TLS certificate chains as presented on the wire' -NeedsInternet -Retries 0 {
         # Connects directly with SslStream so the chain recorded is the one this
         # machine is actually served, not what a browser cached or what the OS
         # substituted. The validation callback always returns true so a chain is
@@ -2364,7 +2443,7 @@ Invoke-Section 'Content Filtering and Interception' 'filtering' {
                 LeafNotBefore = $null; LeafNotAfter = $null; LeafSans = $null
                 RootSubject = $null; RootThumbprint = $null; Error = $null
             }
-            $tcp = $null; $ssl = $null
+            $tcp = $null; $ssl = $null; $bc = $null; $leaf = $null
             try {
                 $tcp = New-Object Net.Sockets.TcpClient
                 $iar = $tcp.BeginConnect($HostName, $Port, $null, $null)
@@ -2378,7 +2457,15 @@ Invoke-Section 'Content Filtering and Interception' 'filtering' {
                 # delegate has its own session state and $script: writes made
                 # inside it do not reach this scope.
                 $cb = [Net.Security.RemoteCertificateValidationCallback]{ return $true }
+                # AuthenticateAsClient reads from the NetworkStream, whose
+                # ReadTimeout defaults to Infinite. A middlebox that completes
+                # the TCP handshake and then sends nothing would hang the whole
+                # run here - which is precisely the behaviour being probed for.
+                $tcp.ReceiveTimeout = $TimeoutMs
+                $tcp.SendTimeout    = $TimeoutMs
                 $ssl = New-Object Net.Security.SslStream($tcp.GetStream(), $false, $cb)
+                $ssl.ReadTimeout  = $TimeoutMs
+                $ssl.WriteTimeout = $TimeoutMs
                 $ssl.AuthenticateAsClient($HostName)
 
                 $res.Protocol       = $ssl.SslProtocol.ToString()
@@ -2438,8 +2525,11 @@ Invoke-Section 'Content Filtering and Interception' 'filtering' {
                 }
             } catch { $res.Error = $_.Exception.Message }
             finally {
-                if ($ssl) { try { $ssl.Dispose() } catch { } }
-                if ($tcp) { try { $tcp.Close() } catch { } }
+                if ($ssl)  { try { $ssl.Dispose() }  catch { } }
+                if ($tcp)  { try { $tcp.Close() }    catch { } }
+                # X509Chain and X509Certificate2 own native cert contexts.
+                if ($bc)   { try { $bc.Dispose() }   catch { } }
+                if ($leaf) { try { $leaf.Dispose() } catch { } }
             }
             return [pscustomobject]$res
         }
@@ -2513,7 +2603,7 @@ Invoke-Section 'Content Filtering and Interception' 'filtering' {
             Out-Raw ''
             Out-KV 'signing issuer' $subj
             Out-KV '  hosts'        (($g.Group | ForEach-Object { $_.Host }) -join ', ')
-            Out-KV '  matches a public-CA name' $(if ($subj -match $publicCA) { 'yes' } else { 'NO' })
+            Out-KV '  matches a public-CA name' $(if ($subj -match $publicCA) { 'yes' } else { 'no' })
             $vm = [regex]::Match($subj, $vendorPat)
             Out-KV '  matches a known interception-product name' $(if ($vm.Success) { $vm.Value } else { 'no match in list' })
             # Locate this root in the local certificate stores.
@@ -2862,7 +2952,7 @@ Invoke-Section 'Browsers' 'browsers' {
                     $prefFile = Join-Path $pr.FullName 'Preferences'
                     if (Test-Path $prefFile) {
                         try {
-                            $j = Get-Content $prefFile -Raw | ConvertFrom-Json
+                            $j = Get-Content $prefFile -Raw -ErrorAction Stop | ConvertFrom-Json
                             $friendly = $j.profile.name
                             Out-KV 'ProfileName' $friendly
                             Out-KV 'HardwareAccelerationDisabled' $j.hardware_acceleration_mode_previous
@@ -2899,8 +2989,21 @@ Invoke-Section 'Browsers' 'browsers' {
                         Out-KV '  ExtensionCount' (@($rows).Count)
                     }
                 }
-                $pol = "HKLM:\SOFTWARE\Policies\$(if($b.N -eq 'Edge'){'Microsoft\Edge'}else{'Google\Chrome'})"
-                if (Test-Path $pol) { Out-RawList (Get-ItemProperty $pol | Select-Object -Property * -ExcludeProperty PS*) 'Enterprise policies' }
+                # Each vendor has its own policy hive. Falling through to
+                # Chrome's meant that on a machine with Chrome installed, its
+                # policies were reported under Brave/Opera/Vivaldi as if they
+                # were that browser's.
+                $polMap = @{ 'Chrome'='Google\Chrome'; 'Edge'='Microsoft\Edge'
+                             'Brave'='BraveSoftware\Brave-Browser'
+                             'Opera'='OPSoftware\Opera'; 'OperaGX'='OPSoftware\Opera GX'
+                             'Vivaldi'='Vivaldi\Vivaldi' }
+                $polSub = $polMap[$b.N]
+                if ($polSub) {
+                    $pol = "HKLM:\SOFTWARE\Policies\$polSub"
+                    Out-KV '    policy hive' $pol
+                    if (Test-Path $pol) { Out-RawList (Get-ItemProperty $pol | Select-Object -Property * -ExcludeProperty PS*) 'Enterprise policies' }
+                    else { Out-Raw '    (no enterprise policy hive for this browser)' }
+                }
             } else {
                 foreach ($pr in (Get-ChildItem -LiteralPath $b.R -Directory -ErrorAction SilentlyContinue)) {
                     Out-KV ("Profile " + $pr.Name + " GB") (ConvertTo-GB (Get-FolderSize $pr.FullName).Bytes)
@@ -3260,7 +3363,7 @@ Invoke-Section 'Sysinternals' 'sysinternals' {
         @{Exe='psinfo.exe';    Args='-accepteula -nobanner -s -d';      Out='psinfo.txt'},
         @{Exe='psservice.exe'; Args='-accepteula -nobanner';            Out='psservice.txt'},
         @{Exe='tcpvcon.exe';   Args='-accepteula -nobanner -a -n';      Out='tcpvcon.txt'},
-        @{Exe='sigcheck.exe';  Args='-accepteula -nobanner -u -e -s';   Out='sigcheck_unsigned.txt'},
+        @{Exe='sigcheck.exe';  Args=('-accepteula -nobanner -u -e -s "' + $env:SystemRoot + '\System32"'); Out='sigcheck_unsigned.txt'},
         @{Exe='coreinfo.exe';  Args='-accepteula -nobanner';            Out='coreinfo.txt'}
     )
     foreach ($t in $tools) {
@@ -3378,6 +3481,10 @@ finally {
             Write-Host '   Their data is absent, not empty - the log says so explicitly.' -ForegroundColor Yellow
             Write-Host ''
         }
-        try { Start-Process explorer.exe $script:PkgRoot } catch { }
+        # Only meaningful with an interactive desktop; on a service or
+        # headless session this leaks a detached process instead.
+        if ([Environment]::UserInteractive) {
+            try { Start-Process explorer.exe $script:PkgRoot } catch { }
+        }
     }
 }
