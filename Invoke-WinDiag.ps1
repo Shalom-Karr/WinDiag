@@ -287,7 +287,7 @@ $script:Limits = @{
 $script:LiveConsole = $false
 try { $script:LiveConsole = (-not [Console]::IsOutputRedirected) } catch { }
 
-$script:ToolVersion  = '1.4.1'
+$script:ToolVersion  = '1.5.0'
 $script:ToolBuilt    = '2026-08-05'
 
 $script:Utf8NoBom   = New-Object System.Text.UTF8Encoding($false)
@@ -331,6 +331,39 @@ if (-not (Test-Path -LiteralPath $OutputPath)) {
 }
 try   { $OutputPath = (Resolve-Path -LiteralPath $OutputPath -ErrorAction Stop).ProviderPath }
 catch { Stop-Fatal "The output location could not be resolved: $OutputPath" $_.Exception.Message }
+
+# A package written into a cloud-synced folder gets destroyed while it is being
+# written: the sync client uploads, dehydrates and relocates the very files the
+# collectors are still appending to. Observed on a real run - json/, counters/,
+# sysinternals/ and 12 of 14 CSVs vanished mid-collection, and ~800 MB was
+# pushed into the user's sync quota. This is the DEFAULT path on any machine
+# using OneDrive Known Folder Move, because there the Desktop IS OneDrive.
+$script:CloudSyncedOutput = $false
+$cloudMarkers = @('OneDrive','Dropbox','Google Drive','GoogleDrive','Box','iCloudDrive','Creative Cloud Files')
+foreach ($cm in $cloudMarkers) {
+    if ($OutputPath -like "*$cm*") { $script:CloudSyncedOutput = $true; break }
+}
+if (-not $script:CloudSyncedOutput) {
+    # Catch redirection that is not visible in the path text.
+    try {
+        $od = (Get-ItemProperty 'HKCU:\Software\Microsoft\OneDrive\Accounts\Personal' -ErrorAction SilentlyContinue).UserFolder
+        if ($od -and $OutputPath.StartsWith($od, [StringComparison]::OrdinalIgnoreCase)) { $script:CloudSyncedOutput = $true }
+    } catch { }
+}
+if ($script:CloudSyncedOutput) {
+    $fallback = Join-Path $env:SystemDrive 'WinDiag'
+    Write-Host ''
+    Write-Host '  The chosen output location is inside a cloud-synced folder:' -ForegroundColor Yellow
+    Write-Host ("     $OutputPath") -ForegroundColor Yellow
+    Write-Host '  Writing a package there corrupts it - the sync client moves and' -ForegroundColor Yellow
+    Write-Host '  dehydrates files while the collectors are still writing them, and' -ForegroundColor Yellow
+    Write-Host '  the package consumes the sync quota. Redirecting to:' -ForegroundColor Yellow
+    Write-Host ("     $fallback") -ForegroundColor Cyan
+    Write-Host '  Pass -OutputPath explicitly to override.' -ForegroundColor DarkGray
+    Write-Host ''
+    $OutputPath = $fallback
+    try { New-Item -ItemType Directory -Path $OutputPath -Force -ErrorAction Stop | Out-Null } catch { }
+}
 
 $script:PkgRoot = Join-Path $OutputPath $script:PkgName
 if ([string]::IsNullOrWhiteSpace($script:PkgRoot)) {
