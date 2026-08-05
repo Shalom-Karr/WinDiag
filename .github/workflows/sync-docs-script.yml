@@ -1,0 +1,41 @@
+name: Sync script to Pages
+
+# docs/Invoke-WinDiag.ps1 is what the download button on the site serves. It is a
+# copy of the root script, so it can silently drift. This keeps them identical
+# rather than relying on remembering to copy it by hand.
+
+on:
+  push:
+    branches: [master]
+    paths: ['Invoke-WinDiag.ps1']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy script into docs/ if it differs
+        id: copy
+        run: |
+          if cmp -s Invoke-WinDiag.ps1 docs/Invoke-WinDiag.ps1; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "docs copy already matches root"
+          else
+            cp Invoke-WinDiag.ps1 docs/Invoke-WinDiag.ps1
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "docs copy refreshed from root"
+          fi
+
+      - name: Commit the refreshed copy
+        if: steps.copy.outputs.changed == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/Invoke-WinDiag.ps1
+          git commit -m "chore(pages): sync docs/Invoke-WinDiag.ps1 with root script"
+          git push

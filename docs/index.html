@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="en" class="scroll-smooth">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WinDiag — Windows diagnostic data collector</title>
+<meta name="description" content="A read-only PowerShell collector that dumps everything needed to diagnose a slow or unstable Windows PC into a log package — and deliberately draws no conclusions of its own.">
+<meta property="og:title" content="WinDiag — Windows diagnostic data collector">
+<meta property="og:description" content="Collects the evidence. Draws no conclusions. Hand the log to a technician or an AI and let them decide.">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔎</text></svg>">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = { theme: { extend: { fontFamily: {
+  mono: ['ui-monospace','SFMono-Regular','Menlo','Consolas','monospace'],
+  sans: ['Inter','system-ui','-apple-system','Segoe UI','sans-serif'] } } } }
+</script>
+<style>
+  body { background:#0f172a; }
+  .card { background:#1e293b; border:1px solid #334155; }
+  .glow { box-shadow: 0 0 60px -15px rgba(56,189,248,.35); }
+  pre.cmd { background:#0b1220; border:1px solid #334155; }
+  .lead { color:#cbd5e1; }
+  details > summary { cursor:pointer; list-style:none; }
+  details > summary::-webkit-details-marker { display:none; }
+  details[open] .chev { transform: rotate(90deg); }
+  .chev { transition: transform .15s ease; }
+</style>
+</head>
+<body class="text-slate-200 font-sans antialiased">
+
+<!-- nav -->
+<nav class="border-b border-slate-800 sticky top-0 z-30 bg-slate-900/80 backdrop-blur">
+  <div class="max-w-5xl mx-auto px-5 h-14 flex items-center justify-between">
+    <span class="font-mono font-semibold text-sky-400">WinDiag</span>
+    <div class="flex items-center gap-5 text-sm">
+      <a href="#run" class="text-slate-400 hover:text-slate-100 transition">How to run</a>
+      <a href="#collects" class="text-slate-400 hover:text-slate-100 transition hidden sm:inline">What it collects</a>
+      <a href="https://github.com/Shalom-Karr/WinDiag" class="text-slate-400 hover:text-slate-100 transition">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<!-- hero -->
+<header class="max-w-5xl mx-auto px-5 pt-16 pb-12 text-center">
+  <div class="inline-flex items-center gap-2 text-xs font-mono px-3 py-1 rounded-full border border-slate-700 text-slate-400 mb-6">
+    <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span> read-only · changes nothing
+  </div>
+  <h1 class="text-4xl sm:text-6xl font-bold tracking-tight text-white">
+    It collects the evidence.<br>
+    <span class="text-sky-400">You draw the conclusions.</span>
+  </h1>
+  <p class="lead mt-6 text-lg max-w-2xl mx-auto leading-relaxed">
+    A single PowerShell script that dumps an exhaustive snapshot of a Windows machine —
+    hardware, storage, memory, network, startup, browsers, event logs — so someone holding
+    <em>only that log</em> can work out why the PC is slow, freezing or unstable.
+  </p>
+
+  <div class="mt-10 flex flex-col sm:flex-row gap-3 justify-center items-center">
+    <a href="Invoke-WinDiag.ps1" download="Invoke-WinDiag.ps1"
+       class="glow inline-flex items-center gap-2.5 bg-sky-500 hover:bg-sky-400 text-slate-950 font-semibold px-7 py-3.5 rounded-lg transition">
+      <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M12 3v13m0 0l-4.5-4.5M12 16l4.5-4.5M4 21h16"/>
+      </svg>
+      Download Invoke-WinDiag.ps1
+    </a>
+    <a href="https://github.com/Shalom-Karr/WinDiag"
+       class="inline-flex items-center gap-2 border border-slate-700 hover:border-slate-500 text-slate-300 px-6 py-3.5 rounded-lg transition">
+      View source
+    </a>
+  </div>
+  <p class="mt-4 text-xs text-slate-500 font-mono">
+    single file · ~190 KB · PowerShell 5.1 · Windows 10 / 11
+  </p>
+</header>
+
+<!-- the principle -->
+<section class="max-w-5xl mx-auto px-5 pb-16">
+  <div class="card rounded-xl p-7 sm:p-9">
+    <h2 class="text-2xl font-semibold text-white">Collect, don't conclude</h2>
+    <p class="lead mt-4 leading-relaxed">
+      This toolkit performs no analysis, assigns no severities, flags nothing as "critical",
+      and offers no recommendations.
+    </p>
+    <p class="lead mt-3 leading-relaxed">
+      That's deliberate. A threshold baked in by the tool author is an opinion formed without
+      knowing the machine, the workload, or the question being asked — and it biases whoever
+      reads the output afterwards. So the log carries labelled facts plus neutral reference
+      context, and never a verdict.
+    </p>
+    <div class="mt-6 grid sm:grid-cols-2 gap-3">
+      <div class="rounded-lg border border-emerald-800/50 bg-emerald-950/30 p-4">
+        <div class="text-xs font-mono text-emerald-400 mb-2">WHAT IT WRITES</div>
+        <p class="text-sm text-slate-300 font-mono leading-relaxed">
+          Interrupts/sec: 412<br>
+          <span class="text-slate-500">CONTEXT: Windows default timer resolution is
+          15.6 ms, producing ~64 timer interrupts/sec at idle.</span>
+        </p>
+      </div>
+      <div class="rounded-lg border border-rose-900/50 bg-rose-950/20 p-4">
+        <div class="text-xs font-mono text-rose-400 mb-2">WHAT IT NEVER WRITES</div>
+        <p class="text-sm text-slate-400 font-mono leading-relaxed line-through decoration-rose-500/60">
+          Interrupts/sec: 412<br>
+          ⚠ CRITICAL — interrupt storm detected,<br>
+          disable the offending driver
+        </p>
+      </div>
+    </div>
+    <p class="lead mt-6 text-sm">
+      The output is meant to be handed to a technician or pasted into an AI for analysis.
+      Both do better work when they're given facts rather than someone else's guess.
+    </p>
+  </div>
+</section>
+
+<!-- how to run -->
+<section id="run" class="max-w-5xl mx-auto px-5 pb-16">
+  <h2 class="text-2xl font-semibold text-white mb-6">How to run it</h2>
+
+  <div class="space-y-4">
+    <div class="card rounded-xl p-6">
+      <div class="flex gap-4">
+        <span class="shrink-0 w-8 h-8 rounded-full bg-sky-500/15 text-sky-400 grid place-items-center font-mono text-sm font-bold">1</span>
+        <div class="min-w-0 flex-1">
+          <h3 class="font-semibold text-white">Download the script</h3>
+          <p class="lead text-sm mt-1">Save <code class="font-mono text-sky-300">Invoke-WinDiag.ps1</code> anywhere — Desktop or Downloads is fine.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="card rounded-xl p-6">
+      <div class="flex gap-4">
+        <span class="shrink-0 w-8 h-8 rounded-full bg-sky-500/15 text-sky-400 grid place-items-center font-mono text-sm font-bold">2</span>
+        <div class="min-w-0 flex-1">
+          <h3 class="font-semibold text-white">Open PowerShell and run it</h3>
+          <p class="lead text-sm mt-1 mb-3">
+            Right-click Start → <strong>Terminal</strong> or <strong>Windows PowerShell</strong>.
+            It asks for admin itself, so you don't need to launch it elevated.
+          </p>
+          <div class="relative">
+            <pre class="cmd rounded-lg p-4 text-sm font-mono text-slate-200 overflow-x-auto"><code id="c1">cd $env:USERPROFILE\Downloads
+Set-ExecutionPolicy -Scope Process Bypass -Force
+.\Invoke-WinDiag.ps1</code></pre>
+            <button onclick="copyCmd('c1',this)" class="absolute top-2.5 right-2.5 text-xs font-mono px-2.5 py-1 rounded border border-slate-600 text-slate-400 hover:text-white hover:border-slate-400 bg-slate-900/80 transition">copy</button>
+          </div>
+          <p class="text-xs text-slate-500 mt-3 leading-relaxed">
+            The <code class="font-mono">Set-ExecutionPolicy</code> line applies to that window only and
+            reverts when you close it — it doesn't change any machine setting.
+            A UAC prompt will appear; approving it means storage health, kernel pool and
+            driver data get collected instead of skipped.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="card rounded-xl p-6">
+      <div class="flex gap-4">
+        <span class="shrink-0 w-8 h-8 rounded-full bg-sky-500/15 text-sky-400 grid place-items-center font-mono text-sm font-bold">3</span>
+        <div class="min-w-0 flex-1">
+          <h3 class="font-semibold text-white">Send the ZIP</h3>
+          <p class="lead text-sm mt-1">
+            It writes a <code class="font-mono text-sky-300">WinDiag_&lt;PC&gt;_&lt;date&gt;</code> folder and ZIP
+            to the Desktop. Send that to whoever is diagnosing the machine — everything they
+            need is inside it.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- modes -->
+  <h3 class="text-lg font-semibold text-white mt-10 mb-3">Modes</h3>
+  <div class="card rounded-xl overflow-hidden">
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead class="bg-slate-800/60 text-slate-400 text-xs uppercase tracking-wide">
+          <tr><th class="text-left px-5 py-3 font-medium">Command</th><th class="text-left px-5 py-3 font-medium">Time</th><th class="text-left px-5 py-3 font-medium">Use for</th></tr>
+        </thead>
+        <tbody class="divide-y divide-slate-700/70">
+          <tr><td class="px-5 py-3 font-mono text-sky-300 whitespace-nowrap">-Mode Quick</td><td class="px-5 py-3 text-slate-400 whitespace-nowrap">~2 min</td><td class="px-5 py-3 lead">Fast triage; skips deep filesystem scans</td></tr>
+          <tr><td class="px-5 py-3 font-mono text-sky-300 whitespace-nowrap">-Mode Full</td><td class="px-5 py-3 text-slate-400 whitespace-nowrap">~10 min</td><td class="px-5 py-3 lead">Default. Run this one if unsure</td></tr>
+          <tr><td class="px-5 py-3 font-mono text-sky-300 whitespace-nowrap">-Mode Deep</td><td class="px-5 py-3 text-slate-400 whitespace-nowrap">30–60 min</td><td class="px-5 py-3 lead">Everything, extended counter capture</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <details class="card rounded-xl p-6 mt-4">
+    <summary class="flex items-center gap-2 font-semibold text-white">
+      <svg class="chev w-4 h-4 text-sky-400" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg>
+      Other options
+    </summary>
+    <div class="mt-4 overflow-x-auto">
+      <table class="w-full text-sm">
+        <tbody class="divide-y divide-slate-700/70">
+          <tr><td class="py-2.5 pr-5 font-mono text-sky-300 whitespace-nowrap align-top">-NoElevate</td><td class="py-2.5 lead">Run without asking for admin; admin-only collectors log as skipped</td></tr>
+          <tr><td class="py-2.5 pr-5 font-mono text-sky-300 whitespace-nowrap align-top">-NoInternet</td><td class="py-2.5 lead">Suppress every collector that touches the network</td></tr>
+          <tr><td class="py-2.5 pr-5 font-mono text-sky-300 whitespace-nowrap align-top">-OutputPath D:\Diag</td><td class="py-2.5 lead">Write the package somewhere other than the Desktop</td></tr>
+          <tr><td class="py-2.5 pr-5 font-mono text-sky-300 whitespace-nowrap align-top">-OnlySection storage</td><td class="py-2.5 lead">Run just one area (storage, memory, cpu, network, filtering…)</td></tr>
+          <tr><td class="py-2.5 pr-5 font-mono text-sky-300 whitespace-nowrap align-top">-NoCompress</td><td class="py-2.5 lead">Leave the folder, skip the ZIP</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </details>
+</section>
+
+<!-- safety -->
+<section class="max-w-5xl mx-auto px-5 pb-16">
+  <h2 class="text-2xl font-semibold text-white mb-6">What it does to the machine</h2>
+  <div class="grid sm:grid-cols-2 gap-4">
+    <div class="card rounded-xl p-6">
+      <h3 class="font-semibold text-white flex items-center gap-2">
+        <span class="text-emerald-400">✓</span> Nothing
+      </h3>
+      <p class="lead text-sm mt-2 leading-relaxed">
+        Read-only. No registry writes, no service changes, no cleanup, no "fixes".
+        It reads state and writes a log.
+      </p>
+    </div>
+    <div class="card rounded-xl p-6">
+      <h3 class="font-semibold text-white flex items-center gap-2">
+        <span class="text-emerald-400">✓</span> Survives a crash
+      </h3>
+      <p class="lead text-sm mt-2 leading-relaxed">
+        Every line is flushed to disk as it's written. If the machine bluescreens
+        mid-run, everything collected up to that moment is already saved.
+      </p>
+    </div>
+    <div class="card rounded-xl p-6">
+      <h3 class="font-semibold text-white flex items-center gap-2">
+        <span class="text-emerald-400">✓</span> One failure doesn't stop it
+      </h3>
+      <p class="lead text-sm mt-2 leading-relaxed">
+        Each collector is isolated with retries. A failure is recorded as FAILED in
+        the log, so missing data stays distinguishable from a genuine empty result.
+      </p>
+    </div>
+    <div class="card rounded-xl p-6">
+      <h3 class="font-semibold text-white flex items-center gap-2">
+        <span class="text-amber-400">!</span> The output is detailed
+      </h3>
+      <p class="lead text-sm mt-2 leading-relaxed">
+        It contains machine names, user names, installed software, file paths and
+        network configuration. Treat the package as sensitive and send it only to
+        someone you trust.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- what it collects -->
+<section id="collects" class="max-w-5xl mx-auto px-5 pb-16">
+  <h2 class="text-2xl font-semibold text-white mb-6">What it collects</h2>
+  <div class="grid sm:grid-cols-2 gap-4">
+
+    <div class="card rounded-xl p-5">
+      <h3 class="font-semibold text-sky-400 text-sm font-mono mb-2">SYSTEM SUMMARY</h3>
+      <p class="lead text-sm leading-relaxed">Everything on the Settings → About page: device name, processor, RAM, graphics, storage, system type — plus the build-derived Windows generation, because the registry still says "Windows 10" on many Windows 11 machines.</p>
+    </div>
+
+    <div class="card rounded-xl p-5">
+      <h3 class="font-semibold text-sky-400 text-sm font-mono mb-2">STORAGE &amp; FILESYSTEM</h3>
+      <p class="lead text-sm leading-relaxed">Decoded SMART attribute tables, NVMe PCIe link speed and width, MFT geometry and zone, USN journal, sector geometry and partition alignment, filter driver stack, TRIM, BitLocker, Storage Spaces, biggest folders and files.</p>
+    </div>
+
+    <div class="card rounded-xl p-5">
+      <h3 class="font-semibold text-sky-400 text-sm font-mono mb-2">CPU &amp; MEMORY</h3>
+      <p class="lead text-sm leading-relaxed">Per-core utilisation, processor queue length, DPC and interrupt time, frequency vs base, power policy and throttle events, page faults, pool usage, handle and GDI counts per process, and a growth sample for leak evidence.</p>
+    </div>
+
+    <div class="card rounded-xl p-5">
+      <h3 class="font-semibold text-sky-400 text-sm font-mono mb-2">NETWORK</h3>
+      <p class="lead text-sm leading-relaxed">Adapters, Wi-Fi band and channel, 30-day per-profile data usage, DNS timing, proxy and PAC config, mapped drives, listening ports — and a live throughput measurement with latency distribution.</p>
+    </div>
+
+    <div class="card rounded-xl p-5">
+      <h3 class="font-semibold text-sky-400 text-sm font-mono mb-2">CONTENT FILTERING &amp; TLS</h3>
+      <p class="lead text-sm leading-relaxed">Detects filtering software and, by comparing certificate issuers across unrelated sites, identifies TLS interception <em>and names the party doing it</em>. Built and verified against real filtered machines.</p>
+    </div>
+
+    <div class="card rounded-xl p-5">
+      <h3 class="font-semibold text-sky-400 text-sm font-mono mb-2">SOFTWARE &amp; STARTUP</h3>
+      <p class="lead text-sm leading-relaxed">Every installed program, every executable on disk with its publisher, every driver file, scheduled tasks, services, Run keys, shell extensions, and browser extensions by name.</p>
+    </div>
+
+    <div class="card rounded-xl p-5">
+      <h3 class="font-semibold text-sky-400 text-sm font-mono mb-2">SEARCH HIJACK &amp; PERSISTENCE</h3>
+      <p class="lead text-sm leading-relaxed">Default search engine and homepage per browser profile, browser policy keys, shortcut target arguments, force-installed extensions, protocol handlers — the places unwanted software changes things.</p>
+    </div>
+
+    <div class="card rounded-xl p-5">
+      <h3 class="font-semibold text-sky-400 text-sm font-mono mb-2">EVENTS &amp; CRASHES</h3>
+      <p class="lead text-sm leading-relaxed">Errors grouped by frequency, application crashes and hangs, unexpected shutdowns and bugchecks, storage subsystem errors, GPU driver resets, and boot/logon performance events that name the process responsible.</p>
+    </div>
+  </div>
+
+  <p class="lead text-sm mt-5">
+    Sysinternals tools (<code class="font-mono">autorunsc</code>, <code class="font-mono">handle</code>,
+    <code class="font-mono">sigcheck</code>…) are used automatically if they're on PATH or sitting
+    beside the script. If they're absent the run continues normally.
+  </p>
+</section>
+
+<!-- output -->
+<section class="max-w-5xl mx-auto px-5 pb-16">
+  <h2 class="text-2xl font-semibold text-white mb-6">What you get back</h2>
+  <div class="card rounded-xl p-6">
+    <pre class="text-sm font-mono text-slate-300 overflow-x-auto leading-relaxed"><code>WinDiag_LAPTOP-A1B2_2026-08-04_170000/
+├── <span class="text-sky-400">logs/</span>
+│   ├── Master.log        <span class="text-slate-500">full execution log, ms timestamps</span>
+│   ├── Errors.log        <span class="text-slate-500">collectors that FAILED</span>
+│   ├── Performance.log   <span class="text-slate-500">per-collector execution time</span>
+│   └── Timeline.log
+├── <span class="text-sky-400">raw/</span>          <span class="text-slate-500">human-readable dumps, one per section</span>
+├── <span class="text-sky-400">json/</span>         <span class="text-slate-500">structured data for programmatic analysis</span>
+├── <span class="text-sky-400">csv/</span>          <span class="text-slate-500">tabular exports</span>
+├── <span class="text-sky-400">eventlogs/</span>    <span class="text-slate-500">exported .evtx</span>
+├── <span class="text-sky-400">counters/</span>     <span class="text-slate-500">performance counter capture</span>
+└── MANIFEST.json  <span class="text-slate-500">written first, so the package is self-describing
+                   even if the run is interrupted</span></code></pre>
+    <p class="lead text-sm mt-5">Every log line follows one format:</p>
+    <pre class="cmd rounded-lg p-3.5 mt-2 text-xs font-mono text-slate-300 overflow-x-auto"><code>[2026-08-04 17:04:22.117] [CHECK  ] [Get-DiskSmart] [+1.284s] C0042 SMART attributes</code></pre>
+    <p class="text-xs text-slate-500 mt-2 font-mono">timestamp | severity | collector | elapsed | message</p>
+  </div>
+</section>
+
+<!-- licence -->
+<section class="max-w-5xl mx-auto px-5 pb-20">
+  <div class="card rounded-xl p-7 border-amber-800/40">
+    <h2 class="text-xl font-semibold text-white">Licence</h2>
+    <p class="lead mt-3 leading-relaxed">
+      <strong class="text-amber-300">Source-available, not open source.</strong>
+      AGPL-3.0 with the Commons Clause.
+    </p>
+    <p class="lead mt-3 text-sm leading-relaxed">
+      Free for personal, educational, research and evaluation use — subject to the AGPL
+      copyleft obligation: if you modify or build on it, you must publish the complete
+      corresponding source of your whole work under the same terms, including if you only
+      run it as a network service.
+    </p>
+    <p class="lead mt-3 text-sm leading-relaxed">
+      <strong class="text-white">Commercial and business use requires a separate paid licence.</strong>
+      That covers internal use by a for-profit company, deployment to employees or clients,
+      bundling with any paid product or support offering, hosting it as a service, and
+      consulting or managed-service work.
+      <a href="https://github.com/Shalom-Karr/WinDiag/issues" class="text-sky-400 hover:text-sky-300 underline">Open an issue</a>
+      to request one.
+    </p>
+  </div>
+</section>
+
+<footer class="border-t border-slate-800">
+  <div class="max-w-5xl mx-auto px-5 py-8 flex flex-col sm:flex-row justify-between gap-3 text-sm text-slate-500">
+    <span>© 2026 Shalom Karr</span>
+    <div class="flex gap-5">
+      <a href="https://github.com/Shalom-Karr/WinDiag" class="hover:text-slate-300 transition">GitHub</a>
+      <a href="https://github.com/Shalom-Karr/WinDiag/blob/master/LICENSE" class="hover:text-slate-300 transition">Licence</a>
+      <a href="Invoke-WinDiag.ps1" download class="hover:text-slate-300 transition">Download</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+function copyCmd(id, btn) {
+  const text = document.getElementById(id).innerText;
+  navigator.clipboard.writeText(text).then(function () {
+    const old = btn.textContent;
+    btn.textContent = 'copied';
+    btn.classList.add('text-emerald-400','border-emerald-500');
+    setTimeout(function () {
+      btn.textContent = old;
+      btn.classList.remove('text-emerald-400','border-emerald-500');
+    }, 1500);
+  });
+}
+</script>
+</body>
+</html>
