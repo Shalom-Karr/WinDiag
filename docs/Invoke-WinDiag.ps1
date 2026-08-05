@@ -287,7 +287,7 @@ $script:Limits = @{
 $script:LiveConsole = $false
 try { $script:LiveConsole = (-not [Console]::IsOutputRedirected) } catch { }
 
-$script:ToolVersion  = '1.4.0'
+$script:ToolVersion  = '1.4.1'
 $script:ToolBuilt    = '2026-08-05'
 
 $script:Utf8NoBom   = New-Object System.Text.UTF8Encoding($false)
@@ -493,6 +493,30 @@ function Close-RawFiles {
     }
     $script:RawWriters = @{}
     $script:RawWriter  = $null
+}
+
+function Out-RawEvents {
+    <#
+      Event records must never go through Out-RawObject. Format-Table truncates
+      a wide column with "...", and for an event the Message IS the payload -
+      Event 101/201 name the process that delayed boot, and that name sits at
+      the end of a long sentence. Emit one labelled block per record instead,
+      with the message written out in full.
+    #>
+    param($Events, [string]$Label = '')
+    if ($Label) { Out-Raw ''; Out-Raw ("### $Label"); Out-Raw ('-' * 100) }
+    # @($null) is an array containing ONE null, not an empty array - so a
+    # plain .Count -eq 0 guard passes straight through when Get-WinEvent
+    # returned nothing, and a blank record gets printed as if it were data.
+    $arr = @($Events | Where-Object { $null -ne $_ })
+    if ($arr.Count -eq 0) { Out-Raw '(no events matched this filter)'; return }
+    Out-KV 'event count' $arr.Count
+    foreach ($e in $arr) {
+        Out-Raw ''
+        Out-Raw ("  [{0}]  Id {1}  {2}  ({3})" -f $e.TimeCreated, $e.Id, $e.LevelDisplayName, $e.ProviderName)
+        $msg = "$($e.Message)"
+        foreach ($ln in ($msg -split "`r?`n")) { Out-Raw ("      " + $ln.TrimEnd()) }
+    }
 }
 
 function Out-RawObject {
@@ -1684,9 +1708,33 @@ Invoke-Section 'Storage' 'storage' {
         Out-RawList (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name BootExecute -ErrorAction SilentlyContinue |
             Select-Object BootExecute) 'BootExecute'
         Out-Raw 'CONTEXT: The default BootExecute value is "autocheck autochk *", which checks only volumes carrying the dirty bit. An explicit /f entry forces a full check of the named volume at next boot.'
+        # -ErrorAction SilentlyContinue does NOT protect this call. When the named
+        # provider is not registered, Get-WinEvent -FilterHashtable throws "The
+        # parameter is incorrect" out of argument validation, which is terminating
+        # and bypasses the preference entirely - it killed this whole collector on
+        # a real machine. Every provider query below is therefore both existence-
+        # checked and wrapped.
+        function Test-ProviderRegistered {
+            param([string]$ProviderName)
+            # Targeted lookup, not Get-WinEvent -ListProvider * - enumerating all
+            # ~1500 providers to test a handful of names measured ~17 seconds.
+            try { return ($null -ne (Get-WinEvent -ListProvider $ProviderName -ErrorAction Stop)) }
+            catch { return $false }
+        }
+
         foreach ($p in @('Microsoft-Windows-Chkdsk','Wininit')) {
-            Out-RawObject (Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName=$p} -MaxEvents 40 -ErrorAction SilentlyContinue |
-                Select-Object TimeCreated, Id, LevelDisplayName, Message) "Application log: $p"
+            if (-not (Test-ProviderRegistered $p)) {
+                Out-Raw ''
+                Out-KV ("Application log: " + $p) 'provider not registered on this machine - no data, not an empty result'
+                continue
+            }
+            try {
+                $ae = Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName=$p} -MaxEvents 40 -ErrorAction Stop
+                Out-RawEvents $ae ("Application log: " + $p)
+            } catch {
+                Out-Raw ''
+                Out-KV ("Application log: " + $p) ('query failed: ' + $_.Exception.Message)
+            }
         }
         # Get-WinEvent -FilterHashtable rejects the WHOLE filter with "The
         # parameter is incorrect" when even one named provider is not registered
@@ -1694,11 +1742,8 @@ Invoke-Section 'Storage' 'storage' {
         # resolve against what is actually registered, then query each provider
         # separately so one absentee cannot void the rest.
         $storProviders = @('disk','Ntfs','storport','stornvme','iaStor','iaStorA','iaStorAVC','atapi','volsnap','vhdmp')
-        $registered = @()
-        try { $registered = @(Get-WinEvent -ListProvider * -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) } catch { }
-        # -contains on a ~1500-entry array is a linear scan, repeated per provider.
         $regSet = @{}
-        foreach ($rn in $registered) { $regSet[$rn] = $true }
+        foreach ($sp in $storProviders) { if (Test-ProviderRegistered $sp) { $regSet[$sp] = $true } }
         Out-KV 'storage providers present'      (($storProviders | Where-Object { $regSet.ContainsKey($_) }) -join ', ')
         Out-KV 'storage providers not present'  (($storProviders | Where-Object { -not $regSet.ContainsKey($_) }) -join ', ')
         Out-Raw 'CONTEXT: A provider listed as not present is not registered on this machine, which is normal - storage miniport providers depend on the controller and driver in use.'
@@ -3474,14 +3519,14 @@ Invoke-Section 'Event Logs' 'eventlogs' {
     Invoke-Collector 'Application crashes and hangs (1000/1001/1002)' {
         $ev = Get-WinEvent -FilterHashtable @{LogName='Application'; Id=1000,1001,1002; StartTime=(Get-Date).AddDays(-$script:Cfg.EventDays)} -ErrorAction SilentlyContinue
         Out-KV 'Count' (@($ev).Count)
-        Out-RawObject ($ev | Select-Object TimeCreated, Id, Message) 'Crash and hang events'
+        Out-RawEvents $ev 'Crash and hang events'
         Out-Raw 'CONTEXT: Event 1000 is an application crash, 1002 is an application hang, 1001 is a Windows Error Reporting record.'
     }
 
     Invoke-Collector 'Unexpected shutdowns and bugchecks (41/1001/6008)' {
         $ev = Get-WinEvent -FilterHashtable @{LogName='System'; Id=41,6008,1001; StartTime=(Get-Date).AddDays(-90)} -ErrorAction SilentlyContinue
         Out-KV 'Count (90 days)' (@($ev).Count)
-        Out-RawObject ($ev | Select-Object TimeCreated, ProviderName, Id, Message) 'Shutdown and bugcheck events'
+        Out-RawEvents $ev 'Shutdown and bugcheck events'
         Out-Raw 'CONTEXT: Event 41 is logged when the system rebooted without a clean shutdown. 6008 is the previous shutdown was unexpected.'
     }
 
@@ -3495,14 +3540,14 @@ Invoke-Section 'Event Logs' 'eventlogs' {
     Invoke-Collector 'GPU driver resets (4101)' {
         $ev = Get-WinEvent -FilterHashtable @{LogName='System'; Id=4101; StartTime=(Get-Date).AddDays(-90)} -ErrorAction SilentlyContinue
         Out-KV 'Count (90 days)' (@($ev).Count)
-        Out-RawObject ($ev | Select-Object TimeCreated, Message) 'Display driver reset events'
+        Out-RawEvents $ev 'Display driver reset events'
         Out-Raw 'CONTEXT: Event 4101 is logged when the display driver stopped responding and was recovered (TDR).'
     }
 
     Invoke-Collector 'Boot and logon performance (100/101/200/201)' {
         foreach ($id in @(100,101,200,201)) {
             $ev = Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Diagnostics-Performance/Operational'; Id=$id} -MaxEvents 30 -ErrorAction SilentlyContinue
-            Out-RawObject ($ev | Select-Object TimeCreated, Id, Message) "Event ID $id"
+            Out-RawEvents $ev "Event ID $id"
         }
         Out-Raw 'CONTEXT: 100 is boot completed, 200 is logon completed. 101 and 201 name individual processes that extended those times.'
     }
