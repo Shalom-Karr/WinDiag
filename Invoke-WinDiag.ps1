@@ -896,7 +896,7 @@ Invoke-Section 'System Summary' 'summary' {
         Out-KV 'System type'   ($os.OSArchitecture + ' operating system, ' + $(if ($env:PROCESSOR_ARCHITECTURE -eq 'AMD64') { 'x64-based processor' } else { $env:PROCESSOR_ARCHITECTURE }))
         Out-KV 'Device ID'     (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\SQMClient' -Name MachineId -ErrorAction SilentlyContinue).MachineId
         Out-KV 'Product ID'    (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name ProductId -ErrorAction SilentlyContinue).ProductId
-        Out-KV 'Pen and touch' $(if ((Get-CimInstance Win32_PnPEntity | Where-Object { $_.PNPClass -eq 'HIDClass' -and $_.Name -match 'touch screen|pen' })) { 'Touch or pen input detected' } else { 'No pen or touch input is available for this display' })
+        Out-KV 'Pen and touch' $(if ((Get-CimInstance Win32_PnPEntity -Filter "PNPClass='HIDClass'" | Where-Object { $_.Name -match 'touch screen|pen' })) { 'Touch or pen input detected' } else { 'No pen or touch input is available for this display' })
 
         Out-Raw ''
         Out-Raw '================ WINDOWS SPECIFICATIONS ================'
@@ -1487,8 +1487,9 @@ Invoke-Section 'Storage' 'storage' {
     }
 
     Invoke-Collector 'Write cache and physical disk full properties' {
-        Out-RawList (Get-PhysicalDisk -ErrorAction SilentlyContinue) 'Get-PhysicalDisk (all properties)'
-        foreach ($p in (Get-PhysicalDisk -ErrorAction SilentlyContinue)) {
+        $physDisks = @(Get-PhysicalDisk -ErrorAction SilentlyContinue)
+        Out-RawList $physDisks 'Get-PhysicalDisk (all properties)'
+        foreach ($p in $physDisks) {
             Out-Raw ''
             Out-Raw ('### Storage node view: ' + $p.FriendlyName)
             try { Out-RawList ($p | Get-PhysicalDiskStorageNodeView -ErrorAction Stop) '' } catch { Out-Raw ('  ' + $_.Exception.Message) }
@@ -1550,8 +1551,44 @@ Invoke-Section 'Storage' 'storage' {
     }
 
     Invoke-Collector 'Reparse points, junctions and symbolic links' {
-        Out-RawObject (Get-ChildItem 'C:\' -Recurse -Depth 5 -Force -Attributes ReparsePoint -ErrorAction SilentlyContinue |
-            Select-Object FullName, Attributes, LinkType, @{n='Target';e={$_.Target -join '; '}}, LastWriteTime) 'Reparse points under C:\ to depth 5'
+        # -Attributes is applied by PowerShell AFTER the provider has already
+        # enumerated the tree, so it does not reduce the walk at all. Scanning
+        # all of C:\ to depth 5 therefore visits every directory on the volume -
+        # minutes on a machine with node_modules, Docker volumes or deep repos.
+        # Walk a queue explicitly instead: check each directory's own attributes
+        # before descending, so a reparse point is recorded WITHOUT following it
+        # (which is also what prevents junction loops), and stop on a clock.
+        $rpSw   = [System.Diagnostics.Stopwatch]::StartNew()
+        $rpCap  = $script:Limits.ScanSecs
+        $rpRows = @()
+        $rpQ    = New-Object System.Collections.Queue
+        foreach ($seed in @('C:\', "$env:SystemDrive\Users", "$env:ProgramData", "$env:ProgramFiles", ${env:ProgramFiles(x86)})) {
+            if ($seed -and (Test-Path -LiteralPath $seed)) { $rpQ.Enqueue(@{ P = $seed; D = 0 }) }
+        }
+        $rpTrunc = $false
+        while ($rpQ.Count -gt 0) {
+            if ($rpSw.Elapsed.TotalSeconds -gt $rpCap) { $rpTrunc = $true; break }
+            $cur = $rpQ.Dequeue()
+            try {
+                foreach ($sub in [System.IO.Directory]::EnumerateDirectories($cur.P)) {
+                    $attr = 0
+                    try { $attr = [System.IO.File]::GetAttributes($sub) } catch { continue }
+                    if (($attr -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                        $tgt = ''
+                        try { $tgt = (Get-Item -LiteralPath $sub -Force -ErrorAction Stop).Target -join '; ' } catch { }
+                        $rpRows += [pscustomobject]@{ FullName = $sub; Attributes = $attr; Target = $tgt; Depth = $cur.D }
+                        # deliberately NOT descending - following it is what makes
+                        # a circular junction loop forever
+                        continue
+                    }
+                    if ($cur.D -lt 5) { $rpQ.Enqueue(@{ P = $sub; D = $cur.D + 1 }) }
+                }
+            } catch { }
+        }
+        Out-RawObject $rpRows 'Reparse points (directories), depth 5, not followed'
+        Out-KV 'reparse points found' $rpRows.Count
+        Out-KV 'scan seconds'         ([math]::Round($rpSw.Elapsed.TotalSeconds,1))
+        if ($rpTrunc) { Out-Raw ('NOTE: reparse scan stopped at the ' + $rpCap + 's cap - this listing is INCOMPLETE.') }
         Out-Raw 'CONTEXT: Reparse tag 0xA0000003 is a mount point or directory junction, 0xA000000C is a symbolic link.'
         Out-Raw 'CONTEXT: "C:\Users\Default User" -> "C:\Users\Default" and "C:\Documents and Settings" -> "C:\Users" are intentional OS junctions present on every installation.'
         Out-Raw 'CONTEXT: A junction whose target is an ancestor of itself creates a traversal loop; recursive scanners entering it continue until they hit a path-length limit.'
@@ -1563,7 +1600,7 @@ Invoke-Section 'Storage' 'storage' {
             Out-Raw ''
             Out-Raw "### $rb"
             if (Test-Path $rb -ErrorAction SilentlyContinue) {
-                $items = Get-ChildItem $rb -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer }
+                $items = Get-ChildItem -LiteralPath $rb -Recurse -File -Force -ErrorAction SilentlyContinue
                 Out-KV '  item count' (@($items).Count)
                 Out-KV '  total MB'   (ConvertTo-MB (($items | Measure-Object Length -Sum).Sum))
             } else { Out-Raw '  not present or not accessible' }
@@ -1587,11 +1624,14 @@ Invoke-Section 'Storage' 'storage' {
         $storProviders = @('disk','Ntfs','storport','stornvme','iaStor','iaStorA','iaStorAVC','atapi','volsnap','vhdmp')
         $registered = @()
         try { $registered = @(Get-WinEvent -ListProvider * -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) } catch { }
-        Out-KV 'storage providers present'      (($storProviders | Where-Object { $registered -contains $_ }) -join ', ')
-        Out-KV 'storage providers not present'  (($storProviders | Where-Object { $registered -notcontains $_ }) -join ', ')
+        # -contains on a ~1500-entry array is a linear scan, repeated per provider.
+        $regSet = @{}
+        foreach ($rn in $registered) { $regSet[$rn] = $true }
+        Out-KV 'storage providers present'      (($storProviders | Where-Object { $regSet.ContainsKey($_) }) -join ', ')
+        Out-KV 'storage providers not present'  (($storProviders | Where-Object { -not $regSet.ContainsKey($_) }) -join ', ')
         Out-Raw 'CONTEXT: A provider listed as not present is not registered on this machine, which is normal - storage miniport providers depend on the controller and driver in use.'
         foreach ($prov in $storProviders) {
-            if ($registered -notcontains $prov) { continue }
+            if (-not $regSet.ContainsKey($prov)) { continue }
             try {
                 $pe = Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName=$prov} -MaxEvents 200 -ErrorAction Stop
                 Out-RawObject ($pe | Select-Object TimeCreated, ProviderName, Id, LevelDisplayName, Message) ("System log provider: " + $prov)
@@ -1757,10 +1797,11 @@ Invoke-Section 'Processes and Services' 'processes' {
     }
 
     Invoke-Collector 'Process count grouped by executable name' {
-        Out-RawObject (Get-Process | Group-Object ProcessName | Sort-Object Count -Descending |
+        $allProc = Get-Process -ErrorAction SilentlyContinue
+        Out-RawObject ($allProc | Group-Object ProcessName | Sort-Object Count -Descending |
             Select-Object @{n='Process';e={$_.Name}}, Count,
                           @{n='TotalWS_MB';e={ConvertTo-MB (($_.Group | Measure-Object WorkingSet64 -Sum).Sum)}}) 'Instance counts'
-        Out-KV 'Total process count' (Get-Process).Count
+        Out-KV 'Total process count' (@($allProc).Count)
         Out-Raw 'CONTEXT: Chromium-based browsers spawn one renderer process per site-isolated origin.'
     }
 
@@ -1916,12 +1957,13 @@ Invoke-Section 'Startup and Drivers' 'startup' {
 Invoke-Section 'Network' 'network' {
 
     Invoke-Collector 'Adapters and configuration' {
-        Out-RawList (Get-NetAdapter) 'Get-NetAdapter (all properties)'
+        $na = Get-NetAdapter
+        Out-RawList $na 'Get-NetAdapter (all properties)'
         Out-RawList (Get-NetIPConfiguration -Detailed -ErrorAction SilentlyContinue) 'Get-NetIPConfiguration'
         Out-RawObject (Get-NetIPAddress | Select-Object InterfaceAlias, AddressFamily, IPAddress, PrefixLength, SuffixOrigin, AddressState) 'IP addresses'
         Out-RawObject (Get-NetRoute | Sort-Object RouteMetric) 'Routing table'
         Out-RawObject (Get-NetNeighbor -ErrorAction SilentlyContinue | Where-Object State -ne 'Permanent') 'ARP / neighbour cache'
-        Save-Json (Get-NetAdapter | Select-Object Name, InterfaceDescription, Status, LinkSpeed, MacAddress, DriverVersion, DriverDate) 'net_adapters'
+        Save-Json ($na | Select-Object Name, InterfaceDescription, Status, LinkSpeed, MacAddress, DriverVersion, DriverDate) 'net_adapters'
     }
 
     Invoke-Collector 'Adapter statistics since boot' {
@@ -3064,8 +3106,23 @@ Invoke-Section 'Installed Software' 'software' {
         foreach ($r in $roots) {
             Out-Raw ''
             Out-Raw "### Scanning $r"
-            $found = Get-ChildItem -LiteralPath $r -Recurse -File -Include *.exe -Force -ErrorAction SilentlyContinue |
-                     Select-Object -First $script:Limits.MaxExeScan
+            # Get-ChildItem -Include does NOT pass the mask to the filesystem;
+            # it enumerates every file in the tree and filters in PowerShell.
+            # EnumerateFiles passes *.exe to FindFirstFileEx so non-matching
+            # files are never materialised. Also time-capped, because these
+            # roots can be very large.
+            $exeSw = [System.Diagnostics.Stopwatch]::StartNew()
+            $found = @()
+            try {
+                foreach ($fp in [System.IO.Directory]::EnumerateFiles($r, '*.exe', [System.IO.SearchOption]::AllDirectories)) {
+                    if ($found.Count -ge $script:Limits.MaxExeScan) { break }
+                    if ($exeSw.Elapsed.TotalSeconds -gt $script:Limits.ScanSecs) {
+                        Out-Raw ('  NOTE: scan of this root stopped at the ' + $script:Limits.ScanSecs + 's cap - listing INCOMPLETE.')
+                        break
+                    }
+                    try { $found += (New-Object System.IO.FileInfo $fp) } catch { }
+                }
+            } catch { Out-Raw ('  enumeration error: ' + $_.Exception.Message) }
             Out-KV '  executables found' (@($found).Count)
             foreach ($f in $found) {
                 $vi = $f.VersionInfo
@@ -3099,7 +3156,7 @@ Invoke-Section 'Installed Software' 'software' {
         $rows = @()
         foreach ($r in $sysRoots) {
             if (-not (Test-Path $r)) { continue }
-            $found = Get-ChildItem -LiteralPath $r -File -Include *.exe -Force -ErrorAction SilentlyContinue
+            $found = Get-ChildItem -LiteralPath $r -File -Filter *.exe -Force -ErrorAction SilentlyContinue   # -Filter is passed to the filesystem, -Include is not
             Out-KV "$r executables" (@($found).Count)
             foreach ($f in $found) {
                 $vi = $f.VersionInfo
