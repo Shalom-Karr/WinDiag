@@ -277,6 +277,19 @@ $script:Limits = @{
 # PowerShell 5.1's -Encoding UTF8 writes a BOM. The package is meant to be
 # parsed by another program, and a BOM makes json.load() fail outright and
 # shows up glued to the first CSV column header. One shared no-BOM encoder.
+# Bumped on every published change. Printed in the startup banner and written
+# into MANIFEST.json, so a package can always be traced back to the exact build
+# that produced it - and so "am I running the current version?" is answerable
+# by looking at the screen rather than diffing hashes.
+# The in-progress/overwrite line only makes sense on a live console. When
+# output is redirected to a file or piped, a carriage return does not erase
+# anything, so both halves would end up in the transcript. Detect it once.
+$script:LiveConsole = $false
+try { $script:LiveConsole = (-not [Console]::IsOutputRedirected) } catch { }
+
+$script:ToolVersion  = '1.4.0'
+$script:ToolBuilt    = '2026-08-05'
+
 $script:Utf8NoBom   = New-Object System.Text.UTF8Encoding($false)
 $script:AllServices = $null   # populated by the 'All services' collector, reused later
 
@@ -640,16 +653,25 @@ function Invoke-Collector {
     Out-Raw ('-' * 100)
 
     if ($NeedsAdmin -and -not $script:Cfg.IsAdmin) {
+        Write-Host ("    [--] $Name  (needs administrator)".PadRight(76)) -ForegroundColor DarkYellow
         Out-Raw 'SKIPPED: requires elevation. Re-run as Administrator to collect this.'
         Write-DiagLog "$id $Name - skipped (needs admin)" 'WARN' $Name
         $script:Stats.Skipped++
         return
     }
     if ($NeedsInternet -and $script:Cfg.NoInternet) {
+        Write-Host ("    [--] $Name  (-NoInternet)".PadRight(76)) -ForegroundColor DarkYellow
         Out-Raw 'SKIPPED: -NoInternet specified.'
         Write-DiagLog "$id $Name - skipped (no internet)" 'INFO' $Name
         $script:Stats.Skipped++
         return
+    }
+
+    # Print the name BEFORE the work, without a newline, so the operator can
+    # see what is running right now rather than only what has finished. The
+    # completion line below rewrites this same line with \r.
+    if ($script:LiveConsole) {
+        Write-Host ("    ... $Name").PadRight(76) -NoNewline -ForegroundColor DarkGray
     }
 
     $attempt = 0
@@ -697,7 +719,9 @@ function Invoke-Collector {
             Sync-RawFile
             Write-Stream 'Performance' ("{0,-60} {1,8:N2}s  attempts={2}" -f $Name, $sw.Elapsed.TotalSeconds, $attempt)
             Write-DiagLog "$id $Name" 'CHECK' $Name $sw.Elapsed.TotalSeconds -NoConsole
-            Write-Host ("    - $Name") -ForegroundColor DarkGray
+            $__wdCr = ''
+            if ($script:LiveConsole) { $__wdCr = "`r" }
+            Write-Host ($__wdCr + ("    [OK] $Name  ({0:N1}s)" -f $sw.Elapsed.TotalSeconds).PadRight(76)) -ForegroundColor Green
             return
         }
         catch {
@@ -722,7 +746,9 @@ function Invoke-Collector {
                 }
                 Out-Raw ("    Stack     : " + ($e.ScriptStackTrace -replace "`r?`n", ' | '))
                 Write-DiagLog "$id $Name FAILED: $($e.Exception.Message)" 'ERROR' $Name $sw.Elapsed.TotalSeconds
-                Write-Host ("    ! $Name [failed]") -ForegroundColor Red
+                $__wdCr = ''
+                if ($script:LiveConsole) { $__wdCr = "`r" }
+                Write-Host ($__wdCr + "    [!!] $Name  FAILED".PadRight(76)) -ForegroundColor Red
             }
         }
     }
@@ -795,6 +821,7 @@ Write-Host ('=' * 78) -ForegroundColor Green
 Write-Host '   WINDOWS DIAGNOSTIC COLLECTION TOOLKIT' -ForegroundColor Green
 Write-Host '   Read-only evidence collection. No analysis, no changes.' -ForegroundColor Gray
 Write-Host ('=' * 78) -ForegroundColor Green
+Write-Host ("   Version   : $($script:ToolVersion)  (built $($script:ToolBuilt))") -ForegroundColor Cyan
 Write-Host ("   Mode      : $($script:Cfg.Mode)")
 Write-Host ("   Package   : $($script:PkgRoot)")
 Write-Host ("   Elevated  : $($script:Cfg.IsAdmin)") -ForegroundColor $(if ($script:Cfg.IsAdmin) { 'Green' } else { 'Yellow' })
@@ -810,6 +837,8 @@ Write-Timeline 'RUN START'
 
 # Manifest describing the package, written first so it survives any crash.
 $manifest = [pscustomobject]@{
+    ToolVersion        = $script:ToolVersion
+    ToolBuilt          = $script:ToolBuilt
     Tool               = 'Invoke-WinDiag'
     SchemaVersion      = 1
     Purpose            = 'Raw diagnostic evidence collection. Contains NO analysis or conclusions.'
