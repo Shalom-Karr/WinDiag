@@ -277,7 +277,8 @@ $script:Limits = @{
 # PowerShell 5.1's -Encoding UTF8 writes a BOM. The package is meant to be
 # parsed by another program, and a BOM makes json.load() fail outright and
 # shows up glued to the first CSV column header. One shared no-BOM encoder.
-$script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$script:Utf8NoBom   = New-Object System.Text.UTF8Encoding($false)
+$script:AllServices = $null   # populated by the 'All services' collector, reused later
 
 $script:PkgName = "WinDiag_$($script:Cfg.Computer)_$($script:Cfg.Stamp)"
 
@@ -426,19 +427,59 @@ function Write-Timeline {
 # JSON serialisation of an exotic object fails.
 
 $script:CurrentRawFile = $null
+$script:RawWriter      = $null
+$script:RawWriters     = @{}
 
 function Open-RawFile {
+    <#
+      Add-Content costs a full open / write / close through the PowerShell
+      provider AND every filesystem filter driver on the machine, once per line.
+      Measured on a real machine: 33-49 ms per line, against 0.14 ms through a
+      buffered StreamWriter. At roughly 35,000 raw lines in a Full run that
+      single call was the largest cost in the entire toolkit.
+
+      Durability is preserved by flushing at every COLLECTOR boundary rather
+      than every line - see Invoke-Collector. That keeps the guarantee that
+      matters (a killed or crashed run leaves completed collectors intact on
+      disk) while giving up only the tail of the one collector in flight.
+    #>
     param([string]$Name)
-    $script:CurrentRawFile = Join-Path $script:Dirs.Raw "$Name.txt"
-    if (-not (Test-Path -LiteralPath $script:CurrentRawFile)) {
-        Set-Content -LiteralPath $script:CurrentRawFile -Value '' -Encoding UTF8
+    $path = Join-Path $script:Dirs.Raw "$Name.txt"
+    $script:CurrentRawFile = $path
+    if (-not $script:RawWriters.ContainsKey($path)) {
+        try {
+            $w = New-Object System.IO.StreamWriter($path, $true, $script:Utf8NoBom)
+            $w.AutoFlush = $false
+            $script:RawWriters[$path] = $w
+        } catch {
+            Write-Host "WARN: cannot open raw writer $path - $_" -ForegroundColor Yellow
+            $script:RawWriters[$path] = $null
+        }
     }
+    $script:RawWriter = $script:RawWriters[$path]
 }
 
 function Out-Raw {
     param([string]$Text = '')
     if (-not $script:CurrentRawFile) { Open-RawFile 'misc' }
+    if ($script:RawWriter) {
+        try { $script:RawWriter.WriteLine($Text); return } catch { }
+    }
+    # Same contract as before: a writer failure must never silently lose a line.
     try { Add-Content -LiteralPath $script:CurrentRawFile -Value $Text -Encoding UTF8 } catch { }
+}
+
+function Sync-RawFile {
+    if ($script:RawWriter) { try { $script:RawWriter.Flush() } catch { } }
+}
+
+function Close-RawFiles {
+    foreach ($k in @($script:RawWriters.Keys)) {
+        $w = $script:RawWriters[$k]
+        if ($w) { try { $w.Flush(); $w.Close(); $w.Dispose() } catch { } }
+    }
+    $script:RawWriters = @{}
+    $script:RawWriter  = $null
 }
 
 function Out-RawObject {
@@ -653,6 +694,7 @@ function Invoke-Collector {
             $sw.Stop()
             $script:Stats.Succeeded++
             Out-Raw ("[collector OK - {0:N2}s]" -f $sw.Elapsed.TotalSeconds)
+            Sync-RawFile
             Write-Stream 'Performance' ("{0,-60} {1,8:N2}s  attempts={2}" -f $Name, $sw.Elapsed.TotalSeconds, $attempt)
             Write-DiagLog "$id $Name" 'CHECK' $Name $sw.Elapsed.TotalSeconds -NoConsole
             Write-Host ("    - $Name") -ForegroundColor DarkGray
@@ -670,6 +712,7 @@ function Invoke-Collector {
                 $sw.Stop()
                 $script:Stats.Failed++
                 Out-Raw ''
+                Sync-RawFile
                 Out-Raw '!!! COLLECTOR FAILED - data below is absent, not empty !!!'
                 Out-Raw ("    Exception : " + $e.Exception.GetType().FullName)
                 Out-Raw ("    Message   : " + $e.Exception.Message)
@@ -1774,8 +1817,13 @@ Invoke-Section 'Processes and Services' 'processes' {
 
     Invoke-Collector 'Full process inventory with command lines' {
         $procs = Get-CimInstance Win32_Process
+        # Measured 63.5s here: Get-Process -Id was being called once per process,
+        # and each call enumerates the whole process table internally. One
+        # snapshot into a hashtable turns that into an O(1) lookup.
+        $procById = @{}
+        foreach ($gp in (Get-Process -ErrorAction SilentlyContinue)) { $procById[$gp.Id] = $gp }
         $rows = foreach ($p in $procs) {
-            $ps = Get-Process -Id $p.ProcessId -ErrorAction SilentlyContinue
+            $ps = $procById[[int]$p.ProcessId]
             [pscustomobject]@{
                 Name = $p.Name; PID = $p.ProcessId; PPID = $p.ParentProcessId
                 Path = $p.ExecutablePath
@@ -1806,15 +1854,59 @@ Invoke-Section 'Processes and Services' 'processes' {
     }
 
     Invoke-Collector 'Digital signature status of running executables' {
-        $rows = Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath } |
-            Select-Object -Unique ExecutablePath | ForEach-Object {
-                $sig = Get-AuthenticodeSignature $_.ExecutablePath -ErrorAction SilentlyContinue
+        # Measured 97.5s serially. Verification is per-file, independent, and
+        # I/O plus crypto bound, so it fans out cleanly. Workers return plain
+        # strings - a Signature holds an X509Certificate2 with a native context
+        # that must not outlive its runspace - and every write stays on this
+        # thread, so the output file is byte-identical to the serial version.
+        $paths = @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath } |
+                   Select-Object -ExpandProperty ExecutablePath -Unique)
+        Out-KV 'unique executables to verify' $paths.Count
+        $rows = @()
+        $pool = $null
+        try {
+            $pool = [runspacefactory]::CreateRunspacePool(1, 8)
+            $pool.Open()
+            $work = @()
+            foreach ($fp in $paths) {
+                $psx = [powershell]::Create()
+                $psx.RunspacePool = $pool
+                $null = $psx.AddScript({
+                    param($Path)
+                    $sig = Get-AuthenticodeSignature $Path -ErrorAction SilentlyContinue
+                    [pscustomobject]@{
+                        Path   = $Path
+                        Status = $(if ($sig) { $sig.Status.ToString() } else { 'Unknown' })
+                        Signer = $(if ($sig -and $sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { $null })
+                    }
+                }).AddArgument($fp)
+                $work += [pscustomobject]@{ Shell = $psx; Handle = $psx.BeginInvoke(); Path = $fp }
+            }
+            $deadline = (Get-Date).AddSeconds(180)
+            foreach ($w in $work) {   # input order, so output is deterministic
+                $left = [int]([Math]::Max(0, ($deadline - (Get-Date)).TotalMilliseconds))
+                if ($w.Handle.AsyncWaitHandle.WaitOne($left)) {
+                    try { $rows += $w.Shell.EndInvoke($w.Handle) }
+                    catch { $rows += [pscustomobject]@{ Path = $w.Path; Status = 'Unknown'; Signer = $null } }
+                } else {
+                    try { $w.Shell.Stop() } catch { }
+                    $rows += [pscustomobject]@{ Path = $w.Path; Status = 'TimedOut'; Signer = $null }
+                }
+                try { $w.Shell.Dispose() } catch { }
+            }
+        } catch {
+            Out-Raw ('parallel verification unavailable, falling back to serial: ' + $_.Exception.Message)
+            $rows = foreach ($fp in $paths) {
+                $sig = Get-AuthenticodeSignature $fp -ErrorAction SilentlyContinue
                 [pscustomobject]@{
-                    Path = $_.ExecutablePath
-                    Status = if ($sig) { $sig.Status } else { 'Unknown' }
-                    Signer = if ($sig -and $sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { $null }
+                    Path = $fp
+                    Status = $(if ($sig) { $sig.Status.ToString() } else { 'Unknown' })
+                    Signer = $(if ($sig -and $sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { $null })
                 }
             }
+        } finally {
+            if ($pool) { try { $pool.Close(); $pool.Dispose() } catch { } }
+        }
         Out-RawObject ($rows | Sort-Object Status, Path) 'Signature status of running images'
         Save-Csv $rows 'processes_signatures'
         Out-Raw 'CONTEXT: Status Valid means the Authenticode signature verified. NotSigned means no embedded signature was present.'
@@ -1830,7 +1922,11 @@ Invoke-Section 'Processes and Services' 'processes' {
     }
 
     Invoke-Collector 'All services' {
+        # Measured ~20s per Win32_Service query, and it was being issued four
+        # times across the file. Service state does not change during a
+        # collection run, so one snapshot is used by every later consumer.
         $svc = Get-CimInstance Win32_Service
+        $script:AllServices = $svc
         Out-RawObject ($svc | Select-Object Name, DisplayName, State, StartMode, StartName, ProcessId, PathName | Sort-Object Name) 'Win32_Service (complete)'
         Save-Csv  $svc 'services_all'
         Save-Json $svc 'services_all' 4
@@ -1841,7 +1937,7 @@ Invoke-Section 'Processes and Services' 'processes' {
     }
 
     Invoke-Collector 'Non-Microsoft running services' {
-        Out-RawObject (Get-CimInstance Win32_Service |
+        Out-RawObject ($script:AllServices |
             Where-Object { $_.State -eq 'Running' -and $_.PathName -notlike "*$env:SystemRoot*" } |
             Select-Object Name, DisplayName, StartMode, StartName, PathName | Sort-Object Name) 'Third-party running services'
     }
@@ -1912,15 +2008,21 @@ Invoke-Section 'Startup and Drivers' 'startup' {
             'HKLM:\SOFTWARE\Classes\Directory\Background\shellex\ContextMenuHandlers',
             'HKLM:\SOFTWARE\Classes\AllFilesystemObjects\shellex\ContextMenuHandlers'
         )
+        # -LiteralPath is mandatory here, not a style choice. One of these keys
+        # is literally named "*" (the all-files class). Without -LiteralPath,
+        # PowerShell reads that as a WILDCARD and expands it across every subkey
+        # of HKLM:\SOFTWARE\Classes - tens of thousands of file-association
+        # keys - probing each one for \shellex\ContextMenuHandlers. That turns
+        # a sub-second read into a multi-minute stall that looks like a hang.
         foreach ($r in $roots) {
-            if (Test-Path $r) {
+            if (Test-Path -LiteralPath $r) {
                 Out-Raw ''
                 Out-Raw "### $r"
-                try { Out-RawList (Get-ItemProperty $r | Select-Object -Property * -ExcludeProperty PS*) } catch { }
-                Out-RawObject (Get-ChildItem $r -ErrorAction SilentlyContinue | ForEach-Object {
-                    $d = (Get-ItemProperty $_.PSPath -Name '(default)' -ErrorAction SilentlyContinue).'(default)'
+                try { Out-RawList (Get-ItemProperty -LiteralPath $r -ErrorAction SilentlyContinue | Select-Object -Property * -ExcludeProperty PS*) } catch { }
+                Out-RawObject (Get-ChildItem -LiteralPath $r -ErrorAction SilentlyContinue | ForEach-Object {
+                    $d = (Get-ItemProperty -LiteralPath $_.PSPath -Name '(default)' -ErrorAction SilentlyContinue).'(default)'
                     $n = $null
-                    if ($d) { $n = (Get-ItemProperty "HKLM:\SOFTWARE\Classes\CLSID\$d\InprocServer32" -Name '(default)' -ErrorAction SilentlyContinue).'(default)' }
+                    if ($d) { $n = (Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Classes\CLSID\$d\InprocServer32" -Name '(default)' -ErrorAction SilentlyContinue).'(default)' }
                     [pscustomobject]@{ Handler = $_.PSChildName; CLSID = $d; DLL = $n }
                 })
             }
@@ -2956,7 +3058,9 @@ Invoke-Section 'Search, Homepage and Persistence Settings' 'hijack' {
         } | Sort-Object TaskPath, TaskName) ''
         Out-Raw ''
         Out-Raw '--- Services whose binary is outside the Windows directory ---'
-        Out-RawObject (Get-CimInstance Win32_Service |
+        $svcAll = $script:AllServices
+        if (-not $svcAll) { $svcAll = Get-CimInstance Win32_Service }
+        Out-RawObject ($svcAll |
             Where-Object { $_.PathName -and $_.PathName -notmatch [regex]::Escape($env:SystemRoot) } |
             Select-Object Name, DisplayName, State, StartMode, StartName, PathName | Sort-Object Name) ''
         Out-Raw 'CONTEXT: Third-party applications legitimately create tasks and services here. This lists them so each can be attributed to a known installed program.'
@@ -3184,7 +3288,9 @@ Invoke-Section 'Installed Software' 'software' {
     Invoke-Collector 'System DLL and driver file inventory' {
         $drvDir = "$env:SystemRoot\System32\drivers"
         if (Test-Path $drvDir) {
-            $rows = Get-ChildItem -LiteralPath $drvDir -File -Include *.sys -Force -ErrorAction SilentlyContinue |
+            # -Include is silently ignored when -LiteralPath is used and returns
+            # every file; -Filter is passed to the filesystem and actually filters.
+            $rows = Get-ChildItem -LiteralPath $drvDir -File -Filter *.sys -Force -ErrorAction SilentlyContinue |
                 ForEach-Object {
                     $vi = $_.VersionInfo
                     [pscustomobject]@{
@@ -3477,6 +3583,7 @@ finally {
     } catch { }
 
     # ------------------------------------------------------------ close streams
+    Close-RawFiles
     foreach ($k in @($script:Streams.Keys)) {
         try { $script:Streams[$k].Writer.Flush(); $script:Streams[$k].Writer.Close(); $script:Streams[$k].Writer.Dispose() } catch { }
     }
