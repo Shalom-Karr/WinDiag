@@ -154,45 +154,54 @@ if (-not $script:IsElevated -and -not $NoElevate) {
         Write-Host ''
     }
     else {
-        # Rebuild the original invocation. Every bound parameter is forwarded so
-        # the elevated run behaves identically to what was actually typed.
-        $fwd = @()
+        # Rebuild the original invocation so the elevated run behaves identically
+        # to what was typed.
+        #
+        # This is handed to the child through -EncodedCommand rather than -File.
+        # powershell.exe -File parses everything after the script path with
+        # CMD rules, where a single quote is an ordinary character rather than a
+        # string delimiter - so -OutputPath 'C:\Users\x\Desktop' arrives as the
+        # literal value 'C:\Users\x\Desktop WITH the quotes attached, and every
+        # later Join-Path fails with "a drive with the name ''C' does not exist".
+        # -EncodedCommand carries a UTF-16LE PowerShell script instead, which the
+        # child parses with PowerShell rules, so ordinary quoting works and no
+        # amount of spaces, quotes or brackets in a path can break the handoff.
+        $parts = @()
         foreach ($kv in $PSBoundParameters.GetEnumerator()) {
             $k = $kv.Key; $v = $kv.Value
             if ($k -eq 'NoElevate') { continue }
             if ($v -is [switch]) {
-                if ($v.IsPresent) { $fwd += "-$k" }
+                if ($v.IsPresent) { $parts += "-$k" }
             }
             elseif ($v -is [array]) {
-                $fwd += "-$k"
-                $fwd += (($v | ForEach-Object { "'" + ($_ -replace "'","''") + "'" }) -join ',')
+                $parts += "-$k " + (($v | ForEach-Object { "'" + ("$_" -replace "'","''") + "'" }) -join ',')
             }
             else {
-                $fwd += "-$k"
-                $fwd += "'" + ("$v" -replace "'","''") + "'"
+                $parts += "-$k '" + ("$v" -replace "'","''") + "'"
             }
         }
-        # OutputPath defaults to the Desktop of whoever is running. UAC may switch
-        # user context, so pin the resolved path explicitly if it was not given.
+        # OutputPath defaults to the Desktop of whoever is running. UAC can switch
+        # user context, so pin the already-resolved path when it was not supplied.
         if (-not $PSBoundParameters.ContainsKey('OutputPath')) {
-            $fwd += '-OutputPath'
-            $fwd += "'" + ($OutputPath -replace "'","''") + "'"
+            $parts += "-OutputPath '" + ($OutputPath -replace "'","''") + "'"
         }
-        $fwd += '-NoElevate'
+        $parts += '-NoElevate'
+
+        $inner = "& '" + ($selfPath -replace "'","''") + "' " + ($parts -join ' ')
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
 
         $argLine = @(
             '-NoProfile'
             '-ExecutionPolicy','Bypass'
             '-NoExit'
-            '-File', ('"' + $selfPath + '"')
-        ) + $fwd
+            '-EncodedCommand', $encoded
+        )
 
         Write-Host ''
         Write-Host '  This collection needs administrator rights to be complete.' -ForegroundColor Cyan
         Write-Host '  Requesting elevation - approve the Windows prompt.'          -ForegroundColor Cyan
         Write-Host ''
-        Write-Host ('  Script : ' + $selfPath)  -ForegroundColor DarkGray
-        Write-Host ('  Args   : ' + ($fwd -join ' ')) -ForegroundColor DarkGray
+        Write-Host ('  Command : ' + $inner) -ForegroundColor DarkGray
         Write-Host ''
 
         try {
@@ -259,7 +268,48 @@ $script:Limits = @{
 # ##############################################################################
 
 $script:PkgName = "WinDiag_$($script:Cfg.Computer)_$($script:Cfg.Stamp)"
+
+# Validate the output location before anything depends on it. If this is wrong
+# every Join-Path downstream returns null, and the run would otherwise carry on
+# and print a COLLECTION COMPLETE banner having collected nothing - the exact
+# "looks like a result but isn't" outcome this toolkit exists to avoid.
+function Stop-Fatal {
+    param([string]$Message, [string]$Detail = '')
+    Write-Host ''
+    Write-Host '==============================================================================' -ForegroundColor Red
+    Write-Host '   COLLECTION DID NOT START' -ForegroundColor Red
+    Write-Host '==============================================================================' -ForegroundColor Red
+    Write-Host ("   $Message") -ForegroundColor Red
+    if ($Detail) { Write-Host ("   $Detail") -ForegroundColor DarkGray }
+    Write-Host ''
+    Write-Host '   Nothing was collected. Do not send anything - there is no package.' -ForegroundColor Yellow
+    Write-Host '   Re-run with an explicit location, for example:' -ForegroundColor Yellow
+    Write-Host '       .\Invoke-WinDiag.ps1 -OutputPath C:\WinDiag' -ForegroundColor Cyan
+    Write-Host ''
+    exit 1
+}
+
+if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+    Stop-Fatal 'No output location was supplied.'
+}
+# Strip stray quote characters. A path can legally contain almost anything, but
+# a leading or trailing quote is always a quoting accident from the caller, and
+# silently inheriting it produces the DriveNotFound failure described above.
+$OutputPath = $OutputPath.Trim().Trim("'", '"')
+if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+    Stop-Fatal 'The output location was empty after removing surrounding quotes.'
+}
+if (-not (Test-Path -LiteralPath $OutputPath)) {
+    try { New-Item -ItemType Directory -Path $OutputPath -Force -ErrorAction Stop | Out-Null }
+    catch { Stop-Fatal "The output location does not exist and could not be created: $OutputPath" $_.Exception.Message }
+}
+try   { $OutputPath = (Resolve-Path -LiteralPath $OutputPath -ErrorAction Stop).ProviderPath }
+catch { Stop-Fatal "The output location could not be resolved: $OutputPath" $_.Exception.Message }
+
 $script:PkgRoot = Join-Path $OutputPath $script:PkgName
+if ([string]::IsNullOrWhiteSpace($script:PkgRoot)) {
+    Stop-Fatal "Could not build a package path under: $OutputPath"
+}
 
 $script:Dirs = @{
     Root     = $script:PkgRoot
@@ -273,8 +323,12 @@ $script:Dirs = @{
 }
 
 foreach ($d in $script:Dirs.Values) {
+    if ([string]::IsNullOrWhiteSpace($d)) { Stop-Fatal 'A package directory path resolved to nothing.' }
     try { New-Item -ItemType Directory -Path $d -Force -ErrorAction Stop | Out-Null }
-    catch { Write-Host "FATAL: cannot create $d - $_" -ForegroundColor Red; exit 1 }
+    catch { Stop-Fatal "Cannot create $d" $_.Exception.Message }
+    # -Force suppresses some failures, so confirm the directory is really there
+    # rather than trusting that the call returned without throwing.
+    if (-not (Test-Path -LiteralPath $d)) { Stop-Fatal "Directory was not created: $d" }
 }
 
 # ##############################################################################
@@ -3250,17 +3304,48 @@ finally {
     }
 
     $dur2 = (Get-Date) - $script:Cfg.StartTime
+
+    # A run that collected nothing must not look like a successful one. Sending
+    # an empty package wastes the analyst's time and, worse, invites them to
+    # read "no findings" into what is actually "no data".
+    $ranNothing = ($script:Stats.Collectors -eq 0)
+    $bannerColour = if ($ranNothing) { 'Red' } else { 'Green' }
+
     Write-Host ''
-    Write-Host ('=' * 78) -ForegroundColor Green
-    Write-Host '   COLLECTION COMPLETE' -ForegroundColor Green
+    Write-Host ('=' * 78) -ForegroundColor $bannerColour
+    if ($ranNothing) {
+        Write-Host '   COLLECTION PRODUCED NOTHING' -ForegroundColor Red
+    } else {
+        Write-Host '   COLLECTION COMPLETE' -ForegroundColor Green
+    }
     Write-Host ("   Duration   : {0:N1} minutes" -f $dur2.TotalMinutes)
     Write-Host ("   Collectors : {0} run / {1} ok / {2} failed / {3} skipped" -f `
         $script:Stats.Collectors, $script:Stats.Succeeded, $script:Stats.Failed, $script:Stats.Skipped)
     Write-Host ("   Package    : $($script:PkgRoot)") -ForegroundColor White
-    Write-Host ('=' * 78) -ForegroundColor Green
+    Write-Host ('=' * 78) -ForegroundColor $bannerColour
     Write-Host ''
-    Write-Host '   Send the ZIP (or folder) to whoever is analysing it.' -ForegroundColor Gray
-    Write-Host '   This toolkit drew no conclusions - the data is unfiltered.' -ForegroundColor Gray
-    Write-Host ''
-    try { Start-Process explorer.exe $script:PkgRoot } catch { }
+
+    if ($ranNothing) {
+        Write-Host '   No collector ran, so the package is empty. Do NOT send it -' -ForegroundColor Yellow
+        Write-Host '   an empty package reads as "nothing wrong" when it actually' -ForegroundColor Yellow
+        Write-Host '   means "nothing was looked at".' -ForegroundColor Yellow
+        Write-Host ''
+        if ($script:Cfg.OnlySection) {
+            Write-Host ('   -OnlySection was set to: ' + ($script:Cfg.OnlySection -join ', ')) -ForegroundColor Gray
+            Write-Host '   No section matched that name. Re-run without -OnlySection.' -ForegroundColor Gray
+        } else {
+            Write-Host '   Check logs\Errors.log in the package for what went wrong.' -ForegroundColor Gray
+        }
+        Write-Host ''
+    } else {
+        Write-Host '   Send the ZIP (or folder) to whoever is analysing it.' -ForegroundColor Gray
+        Write-Host '   This toolkit drew no conclusions - the data is unfiltered.' -ForegroundColor Gray
+        Write-Host ''
+        if ($script:Stats.Failed -gt 0) {
+            Write-Host ("   {0} collector(s) failed and are listed in logs\Errors.log." -f $script:Stats.Failed) -ForegroundColor Yellow
+            Write-Host '   Their data is absent, not empty - the log says so explicitly.' -ForegroundColor Yellow
+            Write-Host ''
+        }
+        try { Start-Process explorer.exe $script:PkgRoot } catch { }
+    }
 }
