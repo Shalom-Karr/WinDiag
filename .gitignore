@@ -1,0 +1,13 @@
+# Diagnostic output packages
+WinDiag_*/
+WinDiag_*.zip
+*.log
+
+# Sysinternals binaries (download separately)
+Sysinternals/
+*.exe
+
+# Editor
+.vscode/
+.idea/
+*.swp
